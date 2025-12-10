@@ -3,8 +3,15 @@ from __future__ import print_function
 import numpy as np
 import torch
 import torch.utils
+from typing import Optional
+from dataclasses import dataclass
+import time
+import os
+import random
+import math
+from torch.utils.data import Sampler
 from prody import *
-
+from torch.nn.utils.rnn import pad_sequence
 confProDy(verbosity="none")
 
 restype_1to3 = {
@@ -515,8 +522,13 @@ def parse_PDB(
     input_path: str,
     device: str = "cpu",
     chains: list = [],
+    segids: list = [],
     parse_all_atoms: bool = False,
-    parse_atoms_with_zero_occupancy: bool = False
+    parse_atoms_with_zero_occupancy: bool = False,
+    masked_list: list = [],
+    epoch: int = 0,
+    updated_alist: bool = False,
+    modify_list: list = [],
 ):
     """
     input_path : path for the input PDB
@@ -645,8 +657,12 @@ def parse_PDB(
         "Uus",
         "Uuo",
     ]
+    if updated_alist:
+        element_list += ["Unx", "X"]
+
+    
     element_list = [item.upper() for item in element_list]
-    element_dict = dict(zip(element_list, range(1, len(element_list))))
+    element_dict = dict(zip(element_list, range(1, len(element_list) + 1)))
     restype_3to1 = {
         "ALA": "A",
         "ARG": "R",
@@ -776,6 +792,7 @@ def parse_PDB(
         ]
 
     atoms = parsePDB(input_path)
+
     if not parse_atoms_with_zero_occupancy:
         atoms = atoms.select("occupancy > 0")
     if chains:
@@ -783,13 +800,26 @@ def parse_PDB(
         for item in chains:
             str_out += " chain " + item + " or"
         atoms = atoms.select(str_out[1:-3])
-
-    protein_atoms = atoms.select("protein")
-    backbone = protein_atoms.select("backbone")
+    elif segids:
+        str_out = ""
+        for item in chains:
+            str_out += " segment " + item + " or"
+        atoms = atoms.select(str_out[1:-3])
+    try:
+        protein_atoms = atoms.select("protein")
+        backbone = protein_atoms.select("backbone")
+    except Exception as e:
+        # with open('/orcd/scratch/orcd/001/fosterb/pmpnn_experiments/ligandmpnn_potts_nomixed/log_error.out', 'a') as f:
+        #     f.write(str(input_path) + '\n')
+        #     f.write(str(e) + '\n')
+        return None, None, None, None, None
     other_atoms = atoms.select("not protein and not water")
     water_atoms = atoms.select("water")
 
     CA_atoms = protein_atoms.select("name CA")
+
+    if os.path.basename(input_path.split('.')[0]) in modify_list:
+        CA_atoms = CA_atoms[:-2]
     CA_resnums = CA_atoms.getResnums()
     CA_chain_ids = CA_atoms.getChids()
     CA_icodes = CA_atoms.getIcodes()
@@ -845,7 +875,18 @@ def parse_PDB(
         Y = Y[Y_m, :]
         Y_t = Y_t[Y_m]
         Y_m = Y_m[Y_m]
-    except:
+    except Exception as e:
+        # if epoch == 0:
+        #     with open('/orcd/scratch/orcd/001/fosterb/pmpnn_experiments/ligandmpnn_potts_nomixed/data_err.txt', 'a') as f:
+        #         f.write(str(input_path) + '\n')
+        #         f.write(str(e) + '\n')
+        # return None, None, None, None, None
+        Y = np.zeros([1, 3], np.float32)
+        Y_t = np.zeros([1], np.int32)
+        Y_m = np.zeros([1], np.int32)
+    if Y.shape[0] == 0:
+        # with open('/orcd/scratch/orcd/001/fosterb/pmpnn_experiments/ligandmpnn_potts_nomixed/data_err.txt', 'a') as f:
+        #     f.write(str(input_path) + '\n')
         Y = np.zeros([1, 3], np.float32)
         Y_t = np.zeros([1], np.int32)
         Y_m = np.zeros([1], np.int32)
@@ -883,6 +924,16 @@ def parse_PDB(
 
     output_dict["xyz_37"] = torch.tensor(xyz_37, device=device, dtype=torch.float32)
     output_dict["xyz_37_m"] = torch.tensor(xyz_37_m, device=device, dtype=torch.int32)
+    output_dict['chain_mask'] = torch.tensor(
+            np.array(
+                [
+                    item not in masked_list
+                    for item in output_dict["chain_letters"]
+                ],
+                dtype=np.int32,
+            ),
+            device=device,
+        )
 
     return output_dict, backbone, other_atoms, CA_icodes, water_atoms
 
@@ -922,67 +973,552 @@ def get_nearest_neighbours(CB, mask, Y, Y_t, Y_m, number_of_ligand_atoms):
 
     return Y, Y_t, Y_m, D_AB_closest
 
+def _to_dev(data_dict, dev, rank=None):
+    """ Push all tensor objects in the dictionary to the given device.
+
+    Args
+    ----
+    data_dict : dict
+        Dictionary of input features to TERMinator
+    dev : str
+        Device to load tensors onto
+    """
+    for key, value in data_dict.items():
+        if isinstance(value, torch.Tensor):
+            data_dict[key] = value.to(dev)
+            if rank is not None:
+                data_dict[key] = value.to(rank)
+            if data_dict[key].is_floating_point():
+                data_dict[key].requires_grad = True
 
 def featurize(
-    input_dict,
+    input_dicts,
     cutoff_for_score=8.0,
     use_atom_context=True,
     number_of_ligand_atoms=16,
     model_type="protein_mpnn",
+    device="cpu",
+    ligand_mpnn_use_side_chain_context=0,
+    parse_atoms_with_zero_occupancy=1,
+    transmembrane_buried="",
+    transmembrane_interface="",
+    global_transmembrane_label=0,
+    subset_chains=False,
+    epoch=0,
+    updated_alist=True
 ):
-    output_dict = {}
-    if model_type == "ligand_mpnn":
-        mask = input_dict["mask"]
-        Y = input_dict["Y"]
-        Y_t = input_dict["Y_t"]
-        Y_m = input_dict["Y_m"]
-        N = input_dict["X"][:, 0, :]
-        CA = input_dict["X"][:, 1, :]
-        C = input_dict["X"][:, 2, :]
-        b = CA - N
-        c = C - CA
-        a = torch.cross(b, c, axis=-1)
-        CB = -0.58273431 * a + 0.56802827 * b - 0.54067466 * c + CA
-        Y, Y_t, Y_m, D_XY = get_nearest_neighbours(
-            CB, mask, Y, Y_t, Y_m, number_of_ligand_atoms
+   
+    # try:
+    output_dict_list = []
+    batched_output_dict = {}
+    use_side_chain_mask = False
+    use_xyz_37 = False
+    max_cl = 0
+
+    for input_dict in input_dicts:
+        output_dict = {'filepath': input_dict['filepath']}
+
+        # make protein dict
+        if subset_chains:
+            segids = input_dict['chains']
+        else:
+            segids = []
+        input_dict, _, _, icodes, _ = parse_PDB(
+                        input_dict['filepath'],
+                        device='cpu',
+                        segids=segids,
+                        parse_all_atoms=ligand_mpnn_use_side_chain_context,
+                        parse_atoms_with_zero_occupancy=parse_atoms_with_zero_occupancy, ## FIX INPUT MASKED LIST
+                        epoch=epoch,
+                        updated_alist=updated_alist
+                    )
+        # try:
+            
+        # except Exception as e:
+        #     input_dict_str = str(input_dict)
+        #     with open('/orcd/scratch/orcd/001/fosterb/pmpnn_experiments/ligandmpnn_potts_nomixed/test.out', 'w') as f:
+        #         f.write(input_dict_str + '\n')
+        #         f.write(str(e) + '\n')
+        #     raise ValueError
+        #     continue
+        if input_dict is None:
+            # raise ValueError
+            continue
+
+        # make chain_letter + residue_idx + insertion_code mapping to integers
+        R_idx_list = list(input_dict["R_idx"].cpu().numpy())  # residue indices
+        chain_letters_list = list(input_dict["chain_letters"])  # chain letters
+        encoded_residues = []
+        for i, R_idx_item in enumerate(R_idx_list):
+            tmp = str(chain_letters_list[i]) + str(R_idx_item) + icodes[i]
+            encoded_residues.append(tmp)
+
+        fixed_positions = torch.tensor(
+            [int(True) for item in encoded_residues],
+            device=device,
         )
-        mask_XY = (D_XY < cutoff_for_score) * mask * Y_m[:, 0]
-        output_dict["mask_XY"] = mask_XY[None,]
+
+
+        # specify which residues are buried for checkpoint_per_residue_label_membrane_mpnn model
+        if transmembrane_buried:
+            buried_residues = [item for item in transmembrane_buried.split()]
+            buried_positions = torch.tensor(
+                [int(item in buried_residues) for item in encoded_residues],
+                device=device,
+            )
+        else:
+            buried_positions = torch.zeros_like(fixed_positions)
+
+        if transmembrane_interface:
+            interface_residues = [item for item in transmembrane_interface.split()]
+            interface_positions = torch.tensor(
+                [int(item in interface_residues) for item in encoded_residues],
+                device=device,
+            )
+        else:
+            interface_positions = torch.zeros_like(fixed_positions)
+        input_dict["membrane_per_residue_labels"] = 2 * buried_positions * (
+            1 - interface_positions
+        ) + 1 * interface_positions * (1 - buried_positions)
+
+        if model_type == "global_label_membrane_mpnn":
+            input_dict["membrane_per_residue_labels"] = (
+                global_transmembrane_label + 0 * fixed_positions
+            )
+
+        # create chain_mask
+        chains_to_design_list = input_dict["chain_letters"]
+        chain_mask = torch.tensor(
+            np.array(
+                [
+                    item in chains_to_design_list
+                    for item in input_dict["chain_letters"]
+                ],
+                dtype=np.int32,
+            ),
+            device=device,
+        )
+        input_dict["chain_mask"] = chain_mask
+
+
+        if model_type == "ligand_mpnn":
+            mask = input_dict["mask"]
+            Y = input_dict["Y"]
+            Y_t = input_dict["Y_t"]
+            Y_m = input_dict["Y_m"]
+            N = input_dict["X"][:, 0, :]
+            CA = input_dict["X"][:, 1, :]
+            C = input_dict["X"][:, 2, :]
+            b = CA - N
+            c = C - CA
+            a = torch.cross(b, c, axis=-1)
+            CB = -0.58273431 * a + 0.56802827 * b - 0.54067466 * c + CA
+            try:
+                Y, Y_t, Y_m, D_XY = get_nearest_neighbours(
+                    CB, mask, Y, Y_t, Y_m, number_of_ligand_atoms
+                )
+            except Exception as e:
+                # with open('/orcd/scratch/orcd/001/fosterb/pmpnn_experiments/ligandmpnn_potts_nomixed/test2.out', 'w') as f:
+                #     f.write(str(Y.shape) + ' ' + str(Y_t.shape) + ' ' + str(Y_m.shape) + ' ' + str(mask.shape) + ' ' + str(CB.shape) + '\n')
+                #     f.write(str(Y) + '\n')
+                #     f.write(str(Y_t) + '\n')
+                #     f.write(str(Y_m) + '\n')
+                #     f.write(str(e) + '\n')
+                #     f.write(str(output_dict['filepath']))
+                raise e
+            mask_XY = (D_XY < cutoff_for_score) * mask * Y_m[:, 0]
+            output_dict["mask_XY"] = mask_XY
+            if "side_chain_mask" in list(input_dict):
+                output_dict["side_chain_mask"] = input_dict["side_chain_mask"]
+            output_dict["Y"] = Y
+            output_dict["Y_t"] = Y_t
+            output_dict["Y_m"] = Y_m
+            if not use_atom_context:
+                output_dict["Y_m"] = 0.0 * output_dict["Y_m"]
+        elif (
+            model_type == "per_residue_label_membrane_mpnn"
+            or model_type == "global_label_membrane_mpnn"
+        ):
+            output_dict["membrane_per_residue_labels"] = input_dict[
+                "membrane_per_residue_labels"
+            ]
+
+        R_idx_list = []
+        count = 0
+        R_idx_prev = -100000
+        for R_idx in list(input_dict["R_idx"]):
+            if R_idx_prev == R_idx:
+                count += 1
+            R_idx_list.append(R_idx + count)
+            R_idx_prev = R_idx
+        R_idx_renumbered = torch.tensor(R_idx_list, device=R_idx.device)
+        output_dict["R_idx"] = R_idx_renumbered
+        output_dict["R_idx_original"] = input_dict["R_idx"]
+        output_dict["chain_labels"] = input_dict["chain_labels"]
+        output_dict["S"] = input_dict["S"]
+        output_dict["chain_mask"] = input_dict["chain_mask"]
+        output_dict["mask"] = input_dict["mask"]
+        output_dict["X"] = input_dict["X"]
+
+        output_dict["randn"] =  torch.randn(
+            [output_dict["mask"].shape[0]],
+            device=device,
+    )
+
+        if "xyz_37" in list(input_dict):
+            output_dict["xyz_37"] = input_dict["xyz_37"]
+            output_dict["xyz_37_m"] = input_dict["xyz_37_m"]
+            use_xyz_37 = True
+
+        max_cl = max(max_cl, output_dict["X"].shape[1])
+        output_dict_list.append(output_dict)
         if "side_chain_mask" in list(input_dict):
-            output_dict["side_chain_mask"] = input_dict["side_chain_mask"][None,]
-        output_dict["Y"] = Y[None,]
-        output_dict["Y_t"] = Y_t[None,]
-        output_dict["Y_m"] = Y_m[None,]
-        if not use_atom_context:
-            output_dict["Y_m"] = 0.0 * output_dict["Y_m"]
+            use_side_chain_mask = True
+        
+    if len(output_dict_list) == 0:
+        return None
+
+    # with open('/orcd/scratch/orcd/001/fosterb/pmpnn_experiments/ligandmpnn_potts_nomixed/log_feat.out', 'a') as f:
+    #     for out_dict in output_dict_list:
+    #         f.write('\t' + str(out_dict['filepath']) + ' ' + str(out_dict['Y'].shape) + ' ' + str(out_dict['mask'].shape) + ' ' + str(out_dict['X'].shape) + '\n')
+
+    batched_output_dict['filepaths'] = [out_dict['filepath'] for out_dict in output_dict_list]
+    batched_output_dict["R_idx"] = pad_sequence( [out_dict["R_idx"] for out_dict in output_dict_list], batch_first=True, padding_value=-1 )
+    batched_output_dict["R_idx_original"] = pad_sequence( [out_dict["R_idx_original"] for out_dict in output_dict_list], batch_first=True, padding_value=-1 )
+    batched_output_dict["chain_labels"] = pad_sequence( [out_dict["chain_labels"] for out_dict in output_dict_list], batch_first=True, padding_value=-1 )
+    batched_output_dict["S"] = pad_sequence( [out_dict["S"] for out_dict in output_dict_list], batch_first=True, padding_value=0 )
+    batched_output_dict["chain_mask"] = pad_sequence( [out_dict["chain_mask"] for out_dict in output_dict_list], batch_first=True, padding_value=0 )
+    batched_output_dict["mask"] = pad_sequence( [out_dict["mask"] for out_dict in output_dict_list], batch_first=True, padding_value=0 )
+    batched_output_dict["X"] = pad_sequence( [out_dict["X"] for out_dict in output_dict_list], batch_first=True, padding_value=0 )
+    if model_type == "ligand_mpnn":
+        batched_output_dict["mask_XY"] = pad_sequence( [out_dict["mask_XY"] for out_dict in output_dict_list], batch_first=True, padding_value=0 )
+        batched_output_dict["Y"] = pad_sequence( [out_dict["Y"] for out_dict in output_dict_list], batch_first=True, padding_value=0 )
+        batched_output_dict["Y_t"] = pad_sequence( [out_dict["Y_t"] for out_dict in output_dict_list], batch_first=True, padding_value=0 )
+        batched_output_dict["Y_m"] = pad_sequence( [out_dict["Y_m"] for out_dict in output_dict_list], batch_first=True, padding_value=0 )
     elif (
-        model_type == "per_residue_label_membrane_mpnn"
-        or model_type == "global_label_membrane_mpnn"
-    ):
-        output_dict["membrane_per_residue_labels"] = input_dict[
-            "membrane_per_residue_labels"
-        ][None,]
+            model_type == "per_residue_label_membrane_mpnn"
+            or model_type == "global_label_membrane_mpnn"
+        ):
+        batched_output_dict["membrane_per_residue_labels"] = pad_sequence( [out_dict["membrane_per_residue_labels"] for out_dict in output_dict_list], batch_first=True, padding_value=-1 )
+    if use_side_chain_mask:
+        batched_output_dict["side_chain_mask"] = pad_sequence( [out_dict["side_chain_mask"] for out_dict in output_dict_list], batch_first=True, padding_value=0 )
+    if use_xyz_37:
+        batched_output_dict["xyz_37"] = pad_sequence( [out_dict["xyz_37"] for out_dict in output_dict_list], batch_first=True, padding_value=0 )
+        batched_output_dict["xyz_37_m"] = pad_sequence( [out_dict["xyz_37_m"] for out_dict in output_dict_list], batch_first=True, padding_value=0 )
+    batched_output_dict["randn"] = pad_sequence( [out_dict["randn"] for out_dict in output_dict_list], batch_first=True, padding_value=max_cl+1 )
 
-    R_idx_list = []
-    count = 0
-    R_idx_prev = -100000
-    for R_idx in list(input_dict["R_idx"]):
-        if R_idx_prev == R_idx:
-            count += 1
-        R_idx_list.append(R_idx + count)
-        R_idx_prev = R_idx
-    R_idx_renumbered = torch.tensor(R_idx_list, device=R_idx.device)
-    output_dict["R_idx"] = R_idx_renumbered[None,]
-    output_dict["R_idx_original"] = input_dict["R_idx"][None,]
-    output_dict["chain_labels"] = input_dict["chain_labels"][None,]
-    output_dict["S"] = input_dict["S"][None,]
-    output_dict["chain_mask"] = input_dict["chain_mask"][None,]
-    output_dict["mask"] = input_dict["mask"][None,]
+    # with open('/orcd/scratch/orcd/001/fosterb/pmpnn_experiments/ligandmpnn_potts_nomixed/log_feat.out', 'a') as f:
+    #     f.write(str(batched_output_dict['Y'].shape) + ' ' + str(batched_output_dict['mask'].shape) + ' ' + str(batched_output_dict['X'].shape) + str(batched_output_dict["S"].shape) + '\n')
 
-    output_dict["X"] = input_dict["X"][None,]
+    # except Exception as e:
+    #     with open('/orcd/scratch/orcd/001/fosterb/pmpnn_experiments/ligandmpnn_potts_nomixed/log_error.out', 'a') as f:
+    #         f.write(str(e) + '\n')
+    #         for idict in input_dicts:
+    #             f.write(idict['filepath'] + '\n')
+    #     # print(e)
+    #     # for idict in input_dicts:
+    #     #     print(idict)
+    #     return None
+    return batched_output_dict
 
-    if "xyz_37" in list(input_dict):
-        output_dict["xyz_37"] = input_dict["xyz_37"][None,]
-        output_dict["xyz_37_m"] = input_dict["xyz_37_m"][None,]
+def get_ssm_mutations(seq):
+    ALPHABET = 'ACDEFGHIKLMNPQRSTVWYX'
 
-    return output_dict
+        # make mutation list for SSM run
+    mutation_list = []
+    for seq_pos in range(len(seq)):
+        wtAA = seq[seq_pos]
+        # check for missing residues
+        if wtAA != '-':
+            # add each mutation option
+            for mutAA in ALPHABET[:-1]:
+                mutation_list.append(wtAA + str(seq_pos) + mutAA)
+        else:
+            mutation_list.append(None)
+
+    return mutation_list
+
+@dataclass
+class Mutation:
+    position: int
+    wildtype: str
+    mutation: str
+    ddG: Optional[float] = None
+    pdb: Optional[str] = ''
+
+
+class StructureDataset():
+    def __init__(self, pdb_dict_list, verbose=False, truncate=None, max_length=100,
+        alphabet='ACDEFGHIKLMNPQRSTVWYX'):
+        alphabet_set = set([a for a in alphabet])
+        discard_count = {
+            'bad_chars': 0,
+            'too_long': 0,
+            'bad_seq_length': 0
+        }
+
+        self.data = []
+
+        start = time.time()
+        for i, entry in enumerate(pdb_dict_list):
+            entry = {k:v[0] for k,v in entry.items() if len(v) > 0}
+            seq = entry['seq']
+
+            bad_chars = set([s for s in seq]).difference(alphabet_set)
+            if len(bad_chars) == 0:
+                if len(entry['seq']) <= max_length:
+                    self.data.append(entry)
+                else:
+                    discard_count['too_long'] += 1
+            else:
+                #print(name, bad_chars, entry['seq'])
+                discard_count['bad_chars'] += 1
+
+            # Truncate early
+            if truncate is not None and len(self.data) == truncate:
+                return
+
+            if verbose and (i + 1) % 1000 == 0:
+                elapsed = time.time() - start
+                print('{} entries ({} loaded) in {:.1f} s'.format(len(self.data), i+1, elapsed))
+
+            #print('Discarded', discard_count)
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        if isinstance(idx, list):
+            return [self.data[i] for i in idx]
+        return self.data[idx]
+    
+class StructureSampler(Sampler):
+    def __init__(self, dataset, num_replicas, rank, batch_size=100, device='cpu', cutoff_for_score=8.0, ligand_mpnn_use_atom_context=1, atom_context_num=25, model_type='ligand_mpnn',
+                 ligand_mpnn_use_side_chain_context=0, parse_atoms_with_zero_occupancy=0, transmembrane_buried="", transmembrane_interface="", global_transmembrane_label=0, subset_chains=False, updated_alist=True):
+        self.size = len(dataset)
+        self.num_replicas = num_replicas
+        self.rank = rank
+        self.lengths = [len(dataset[i]['seq']) for i in range(self.size)]
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.device = device
+        self.cutoff_for_score = cutoff_for_score
+        self.ligand_mpnn_use_atom_context = ligand_mpnn_use_atom_context
+        self.atom_context_num = atom_context_num
+        self.model_type = model_type
+        self.ligand_mpnn_use_side_chain_context = ligand_mpnn_use_side_chain_context
+        self.parse_atoms_with_zero_occupancy = parse_atoms_with_zero_occupancy
+        self.transmembrane_buried = transmembrane_buried
+        self.transmembrane_interface = transmembrane_interface
+        self.global_transmembrane_label = global_transmembrane_label
+        self.subset_chains = subset_chains
+        self.epoch = 0
+        self.updated_alist = updated_alist
+
+        self._cluster()
+
+    def _set_epoch(self, epoch):
+        self.epoch = epoch
+
+    def _cluster(self):
+        sorted_ix = np.argsort(self.lengths)
+
+        # Cluster into batches of similar sizes
+        clusters, batch = [], []
+        batch_max = 0
+        for ix in sorted_ix:
+            size = self.lengths[ix]
+            # with open('/orcd/scratch/orcd/001/fosterb/pmpnn_experiments/ligandmpnn_potts_nomixed/log_size.out', 'a') as f:
+            #     f.write(str(size) + ' ' + str(len(batch) + 1) + '\n')
+            if size * (len(batch) + 1) <= self.batch_size:
+                batch.append(ix)
+                batch_max = size
+            else:
+                clusters.append(batch)
+                batch, batch_max = [ix], 0
+        if len(batch) > 0 and size * (len(batch) + 1) <= self.batch_size:
+            clusters.append(batch)
+        self.clusters = clusters
+
+    def __len__(self):
+        return len(self.clusters)
+    
+    def package(self, b_idx):
+
+        # with open('/orcd/scratch/orcd/001/fosterb/pmpnn_experiments/ligandmpnn_potts_nomixed/log_package.out', 'a') as f:
+        #         for b in b_idx:
+        #             f.write(str(b['filepath']) + ' ' + str(len(b['seq'])) + '\n')
+
+        return featurize(b_idx,
+                    cutoff_for_score=self.cutoff_for_score,
+                    use_atom_context=self.ligand_mpnn_use_atom_context,
+                    number_of_ligand_atoms=self.atom_context_num,
+                    model_type=self.model_type,
+                    ligand_mpnn_use_side_chain_context=self.ligand_mpnn_use_side_chain_context,
+                    parse_atoms_with_zero_occupancy=self.parse_atoms_with_zero_occupancy,
+                    transmembrane_buried=self.transmembrane_buried,
+                    transmembrane_interface=self.transmembrane_interface,
+                    global_transmembrane_label=self.global_transmembrane_label,
+                    device=self.device,
+                    subset_chains=self.subset_chains,
+                    epoch=self.epoch,
+                    updated_alist=self.updated_alist)
+
+    def __iter__(self):
+        g = torch.Generator()
+        g.manual_seed(self.epoch)
+
+        # self._cluster()
+        # with open('/orcd/scratch/orcd/001/fosterb/pmpnn_experiments/ligandmpnn_potts_nomixed/log_rank.out', 'a') as f:
+        #     f.write('HERE!\n')
+        #     for clust in self.clusters:
+        #         f.write(str(self.rank) + ' ' + str(clust) + '\n')
+        # rank_clusters = self.clusters[self.rank:self.size:self.num_replicas]
+        # with open('/orcd/scratch/orcd/001/fosterb/pmpnn_experiments/ligandmpnn_potts_nomixed/log_rank.out', 'a') as f:
+        #     f.write('HERE!\n')
+        #     for clust in rank_clusters:
+        #         f.write(str(self.rank) + ' ' + str(clust) + '\n')
+        # raise ValueError
+        for b_idx in self.clusters:
+            yield b_idx
+
+class CustomDistributedSampler(Sampler):
+    def __init__(self, sampler, num_replicas, rank):
+        self.sampler = sampler
+        self.num_replicas = num_replicas
+        self.rank = rank
+        self.epoch = 0
+
+        self.indices = list(self.sampler)
+        # self.num_samples = int(math.floor(len(self.indices) / self.num_replicas))
+        self.num_samples = len(self.indices)
+        self.total_size = self.num_samples * self.num_replicas
+
+    def __iter__(self):
+        g = torch.Generator()
+        g.manual_seed(self.epoch)
+
+        rank_indices = self.indices[self.rank:self.total_size:self.num_replicas]
+        return iter(rank_indices)
+
+    def __len__(self):
+        return self.num_samples
+
+    def _set_epoch(self, epoch):
+        self.epoch = epoch
+
+    def package(self, b_idx):
+
+        return featurize(b_idx,
+                    cutoff_for_score=self.sampler.cutoff_for_score,
+                    use_atom_context=self.sampler.ligand_mpnn_use_atom_context,
+                    number_of_ligand_atoms=self.sampler.atom_context_num,
+                    model_type=self.sampler.model_type,
+                    ligand_mpnn_use_side_chain_context=self.sampler.ligand_mpnn_use_side_chain_context,
+                    parse_atoms_with_zero_occupancy=self.sampler.parse_atoms_with_zero_occupancy,
+                    transmembrane_buried=self.sampler.transmembrane_buried,
+                    transmembrane_interface=self.sampler.transmembrane_interface,
+                    global_transmembrane_label=self.sampler.global_transmembrane_label,
+                    device=self.sampler.device,
+                    subset_chains=self.sampler.subset_chains)
+
+class PDB_dataset(torch.utils.data.Dataset):
+    def __init__(self, IDs, loader, params):
+        self.IDs = IDs
+        self.loader = loader
+        self.params = params
+
+    def __len__(self):
+        return len(self.IDs)
+
+    def __getitem__(self, index):
+        ID = self.IDs[index]
+        out = self.loader(ID, self.params)
+        return out
+
+
+def worker_init_fn(worker_id):
+    np.random.seed()
+
+def deduplicate_with_indices(lst):
+    seen = set()
+    deduped = []
+    indices = []
+
+    for i, item in enumerate(lst):
+        # Convert to tuple to make it hashable
+        item_tuple = tuple(item)
+        if item_tuple not in seen:
+            seen.add(item_tuple)
+            deduped.append(item)
+            indices.append(i)
+
+    return indices, deduped
+
+
+def loader_pdb(pdbid,params):
+
+    PREFIX = "%s/pdb/%s/%s"%(params['METADIR'],pdbid[1:3],pdbid)
+    pdb_path = "%s/pdb/%s/%s.pdb"%(params['PDBDIR'],pdbid[1:3],pdbid)
+    
+    # load metadata
+    if not os.path.isfile(PREFIX+".pt") or not os.path.isfile(pdb_path):
+        return {'seq': np.zeros(5)}
+    meta = torch.load(PREFIX+".pt")
+    asmb_ids, asmb_chains = deduplicate_with_indices(meta['asmb_chains'])
+    chids = np.array(meta['chains'])
+
+    # find candidate assemblies which contain chid chain
+    asmb_candidates = set([a for a,b in zip(asmb_ids,asmb_chains)
+                           ])
+
+    # randomly pick one assembly from candidates
+    idx = random.sample(list(asmb_candidates), 1)[0]
+
+    # select chains which idx-th xform should be applied to
+    s1 = set(meta['chains'])
+    s2 = set(meta['asmb_chains'][idx].split(','))
+    chains_k = s1&s2
+
+    seq = ''
+    if params['SUBSET']:
+        for chain in chains_k:
+            cid = meta['chains'].index(chain)
+            seq += meta['seq'][cid][1].replace('-', '')
+    else:
+        for chain_seq in meta['seq']:
+            if len(chain_seq[1].replace('-', '')) > 0:
+                seq += chain_seq[1].replace('-', '')
+            else:
+                seq += chain_seq[0].replace('-', '')
+
+    if params['SUBSET']:
+        homo = set()
+        for chidid in range(len(chids)):
+            chid = chids[chidid]
+            seqid = meta['tm'][chids==chid][0,:,1]
+            homo = homo.union(set([ch_j for seqid_j,ch_j in zip(seqid[chidid+1:],chids[chidid+1:]) if seqid_j>0.7]))
+        homo = list(homo)
+        masked_list = [c for c in chains_k if c in homo]
+    else:
+        masked_list = []
+
+    return {'filepath'    : pdb_path,
+            'chains'    : list(chains_k),
+            'masked_list': masked_list,
+            'seq': seq,
+            'name': pdbid
+            }
+
+def get_pdbs(data_loader, repeat=1, max_length=10000, num_units=1000000):
+    pdb_dict_list = []
+    for _ in range(repeat):
+        for setp,t in enumerate(data_loader):
+            if 'filepath' not in t.keys() or len(t['chains']) == 0 or len(t['seq'][0]) <= 32:
+                # with open('/orcd/scratch/orcd/001/fosterb/pmpnn_experiments/ligandmpnn_potts_nomixed/log_pdbs.out', 'a') as f:
+                #     f.write(str(t['filepath']) + ' ' + str(t['seq']) + ' ' + str(len(t['seq'])) + '\n')
+                continue
+            if len(t['seq'][0]) <= max_length and len(t['seq'][0]) > 0:
+                pdb_dict_list.append(t)
+            if len(pdb_dict_list) >= num_units:
+                break
+    return pdb_dict_list

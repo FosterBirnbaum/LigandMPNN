@@ -2,9 +2,50 @@ from __future__ import print_function
 
 import itertools
 import sys
-
+from etab_utils import merge_duplicate_pairE
 import numpy as np
 import torch
+import torch.nn.functional as F
+
+def checkpoint_multiple_outputs(fn, *args, use_kwargs=False):
+    """Wrap a function with multiple outputs for checkpointing."""
+    def wrapper(*inputs):
+        outputs = fn(*inputs) if not use_kwargs else fn(**inputs[0])
+        if isinstance(outputs, torch.Tensor):
+            return outputs
+        elif isinstance(outputs, (tuple, list)):
+            return tuple(outputs)
+        else:
+            raise RuntimeError("Unsupported output type for checkpointing.")
+    
+    # Flatten outputs and reassemble after checkpoint
+    class CheckpointWrapper(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, *args):
+            ctx.fn = fn
+            with torch.no_grad():
+                outputs = fn(*args) if not use_kwargs else fn(**args[0])
+            if isinstance(outputs, (list, tuple)):
+                ctx.save_for_backward(*args)
+                return tuple(outputs)
+            else:
+                ctx.save_for_backward(*args)
+                return outputs,
+
+        @staticmethod
+        def backward(ctx, *grads):
+            inputs = ctx.saved_tensors
+            detached = [i.detach().requires_grad_() for i in inputs]
+
+            with torch.enable_grad():
+                outputs = fn(*detached) if not use_kwargs else fn(**detached[0])
+            if not isinstance(outputs, (list, tuple)):
+                outputs = (outputs,)
+            grads_wrt_inputs = torch.autograd.grad(outputs, detached, grads, allow_unused=True)
+            return grads_wrt_inputs
+
+    output = CheckpointWrapper.apply(*args)
+    return output if len(output) > 1 else output[0]
 
 
 class ProteinMPNN(torch.nn.Module):
@@ -24,6 +65,13 @@ class ProteinMPNN(torch.nn.Module):
         atom_context_num=0,
         model_type="protein_mpnn",
         ligand_mpnn_use_side_chain_context=False,
+        output_dim=400,
+        node_self_sub=None,
+        clone=True,
+        use_potts=False,
+        for_energy=False,
+        updated_alist=True,
+        potts_context=''
     ):
         super(ProteinMPNN, self).__init__()
 
@@ -31,6 +79,7 @@ class ProteinMPNN(torch.nn.Module):
         self.node_features = node_features
         self.edge_features = edge_features
         self.hidden_dim = hidden_dim
+        self.potts_context = potts_context
 
         if self.model_type == "ligand_mpnn":
             self.features = ProteinFeaturesLigand(
@@ -41,6 +90,7 @@ class ProteinMPNN(torch.nn.Module):
                 device=device,
                 atom_context_num=atom_context_num,
                 use_side_chains=ligand_mpnn_use_side_chain_context,
+                updated_alist=updated_alist
             )
             self.W_v = torch.nn.Linear(node_features, hidden_dim, bias=True)
             self.W_c = torch.nn.Linear(hidden_dim, hidden_dim, bias=True)
@@ -94,6 +144,14 @@ class ProteinMPNN(torch.nn.Module):
             ]
         )
 
+        if self.potts_context == 'simple':
+            self.post_context_encoder_layers = torch.nn.ModuleList(
+                [
+                    EncLayer(hidden_dim, hidden_dim * 2, dropout=dropout)
+                    for _ in range(1)
+                ]
+            )    
+
         # Decoder layers
         self.decoder_layers = torch.nn.ModuleList(
             [
@@ -103,6 +161,12 @@ class ProteinMPNN(torch.nn.Module):
         )
 
         self.W_out = torch.nn.Linear(hidden_dim, num_letters, bias=True)
+        self.use_potts = use_potts
+        self.for_energy = for_energy
+        if use_potts:
+            self.etab_out = torch.nn.Linear(hidden_dim, output_dim, bias=True)
+            self.clone = clone
+            self.node_self_sub = node_self_sub
 
         for p in self.parameters():
             if p.dim() > 1:
@@ -123,7 +187,12 @@ class ProteinMPNN(torch.nn.Module):
             "mask"
         ]  # [B,L] - mask for missing regions - should be removed! all ones most of the time
         # chain_labels = feature_dict["chain_labels"] #[B,L] - integer labels for chain letters
-
+        chain_mask = feature_dict[
+            "chain_mask"
+        ]  # [B,L] - mask for which residues need to be fixed; 0.0 - fixed; 1.0 - will be designed
+        randn = feature_dict[
+            "randn"
+        ]  # [B,L] - random numbers for decoding order; only the first entry is used since decoding within a batch needs to match for symmetry
         B, L = S_true.shape
         device = S_true.device
 
@@ -153,6 +222,15 @@ class ProteinMPNN(torch.nn.Module):
 
             h_V_C = self.V_C(h_V_C)
             h_V = h_V + self.V_C_norm(self.dropout(h_V_C))
+
+            # print(h_V.shape, h_E.shape, Y_nodes.shape, Y_edges.shape, Y_m.shape, Y_m_edges.shape, h_E_context.shape, h_E_context_cat.shape, h_V_C.shape, mask.shape)
+
+            # raise ValueError
+
+            if self.potts_context == 'simple':
+                for layer in self.post_context_encoder_layers:
+                    h_V, h_E = layer(h_V, h_E, E_idx, mask, mask_attend)
+
         elif self.model_type == "protein_mpnn" or self.model_type == "soluble_mpnn":
             E, E_idx = self.features(feature_dict)
             h_V = torch.zeros((E.shape[0], E.shape[1], E.shape[-1]), device=device)
@@ -175,7 +253,131 @@ class ProteinMPNN(torch.nn.Module):
             for layer in self.encoder_layers:
                 h_V, h_E = layer(h_V, h_E, E_idx, mask, mask_attend)
 
-        return h_V, h_E, E_idx
+
+        # Format h_E into Potts model etab
+        if self.use_potts:
+            if self.clone:
+                etab = h_E.clone()
+            else:
+                etab = h_E
+            etab = self.etab_out(etab)
+            n_batch, n_res, k, out_dim = etab.shape
+            etab = etab * mask.view(n_batch, n_res, 1, 1) # ensure output etab is masked properly
+            etab = etab.unsqueeze(-1).view(n_batch, n_res, k, 20, 20)
+            etab[:, :, 0] = etab[:, :, 0] * torch.eye(20).to(etab.device) # zero off-diagonal energies
+            etab = merge_duplicate_pairE(etab, E_idx)
+            etab = etab.view(n_batch, n_res, k, out_dim)
+            if self.node_self_sub == 'encoder':
+                if self.clone:
+                    self_E = h_V.clone()
+                else:
+                    self_E = h_V
+                self_E = self.self_E_out(self_E)
+                etab[..., 0, :] = torch.diag_embed(self_E, dim1=-2, dim2=-1).flatten(start_dim=-2, end_dim=-1)
+        else:
+            etab = None
+
+        return h_V, h_E, etab, E_idx, S_true, mask, chain_mask, randn
+
+    def decode(self, input):
+        h_V, h_E, etab, E_idx, S_true, mask, chain_mask, randn = input
+        device = S_true.device
+        chain_mask = mask * chain_mask  # update chain_M to include missing regions
+
+        decoding_order = torch.argsort(
+            (chain_mask + 0.0001) * (torch.abs(randn))
+        )  # [numbers will be smaller for places where chain_M = 0.0 and higher for places where chain_M = 1.0]
+
+        h_S = self.W_s(S_true)
+        h_ES = cat_neighbors_nodes(h_S, h_E, E_idx)
+
+        # Build encoder embeddings
+        h_EX_encoder = cat_neighbors_nodes(torch.zeros_like(h_S), h_E, E_idx)
+        h_EXV_encoder = cat_neighbors_nodes(h_V, h_EX_encoder, E_idx)
+
+        mask_size = E_idx.shape[1]
+        permutation_matrix_reverse = torch.nn.functional.one_hot(decoding_order, num_classes=mask_size).float()
+        order_mask_backward = torch.einsum('ij, biq, bjp->bqp',(1-torch.triu(torch.ones(mask_size,mask_size, device=device))), permutation_matrix_reverse, permutation_matrix_reverse)
+        if self.for_energy:
+            order_mask_backward = torch.ones_like(order_mask_backward)
+        mask_attend = torch.gather(order_mask_backward, 2, E_idx).unsqueeze(-1)
+        mask_1D = mask.view([mask.size(0), mask.size(1), 1, 1])
+        mask_bw = mask_1D * mask_attend
+        mask_fw = mask_1D * (1. - mask_attend)
+
+        h_EXV_encoder_fw = mask_fw * h_EXV_encoder
+        for layer in self.decoder_layers:
+            h_ESV = cat_neighbors_nodes(h_V, h_ES, E_idx)
+            h_ESV = mask_bw * h_ESV + h_EXV_encoder_fw
+            h_V = layer(h_V, h_ESV, mask)
+
+
+        logits = self.W_out(h_V)
+        log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
+
+        return log_probs, etab, E_idx
+    
+    def forward(self, feature_dict):
+        # xyz_37 = feature_dict["xyz_37"] #[B,L,37,3] - xyz coordinates for all atoms if needed
+        # xyz_37_m = feature_dict["xyz_37_m"] #[B,L,37] - mask for all coords
+        # Y = feature_dict["Y"] #[B,L,num_context_atoms,3] - for ligandMPNN coords
+        # Y_t = feature_dict["Y_t"] #[B,L,num_context_atoms] - element type
+        # Y_m = feature_dict["Y_m"] #[B,L,num_context_atoms] - mask
+        # X = feature_dict["X"] #[B,L,4,3] - backbone xyz coordinates for N,CA,C,O
+        S_true = feature_dict[
+            "S"
+        ]  # [B,L] - integer proitein sequence encoded using "restype_STRtoINT"
+        # R_idx = feature_dict["R_idx"] #[B,L] - primary sequence residue index
+        mask = feature_dict[
+            "mask"
+        ]  # [B,L] - mask for missing regions - should be removed! all ones most of the time
+        chain_mask = feature_dict[
+            "chain_mask"
+        ]  # [B,L] - mask for which residues need to be fixed; 0.0 - fixed; 1.0 - will be designed
+        # chain_labels = feature_dict["chain_labels"] #[B,L] - integer labels for chain letters
+        randn = feature_dict[
+            "randn"
+        ]  # [B,L] - random numbers for decoding order; only the first entry is used since decoding within a batch needs to match for symmetry
+
+        B, L = S_true.shape
+        device = S_true.device
+
+        h_V, h_E, etab, E_idx, S_true, mask, chain_mask, randn = self.encode(feature_dict)
+
+        chain_mask = mask * chain_mask  # update chain_M to include missing regions
+
+        decoding_order = torch.argsort(
+            (chain_mask + 0.0001) * (torch.abs(randn))
+        )  # [numbers will be smaller for places where chain_M = 0.0 and higher for places where chain_M = 1.0]
+
+        h_S = self.W_s(S_true)
+        h_ES = cat_neighbors_nodes(h_S, h_E, E_idx)
+
+        # Build encoder embeddings
+        h_EX_encoder = cat_neighbors_nodes(torch.zeros_like(h_S), h_E, E_idx)
+        h_EXV_encoder = cat_neighbors_nodes(h_V, h_EX_encoder, E_idx)
+
+        mask_size = E_idx.shape[1]
+        permutation_matrix_reverse = torch.nn.functional.one_hot(decoding_order, num_classes=mask_size).float()
+        order_mask_backward = torch.einsum('ij, biq, bjp->bqp',(1-torch.triu(torch.ones(mask_size,mask_size, device=device))), permutation_matrix_reverse, permutation_matrix_reverse)
+        if self.for_energy:
+            order_mask_backward = torch.ones_like(order_mask_backward)
+        mask_attend = torch.gather(order_mask_backward, 2, E_idx).unsqueeze(-1)
+        mask_1D = mask.view([mask.size(0), mask.size(1), 1, 1])
+        mask_bw = mask_1D * mask_attend
+        mask_fw = mask_1D * (1. - mask_attend)
+
+        h_EXV_encoder_fw = mask_fw * h_EXV_encoder
+        for layer in self.decoder_layers:
+            h_ESV = cat_neighbors_nodes(h_V, h_ES, E_idx)
+            h_ESV = mask_bw * h_ESV + h_EXV_encoder_fw
+            h_V = layer(h_V, h_ESV, mask)
+
+
+        logits = self.W_out(h_V)
+        log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
+
+        return log_probs, etab, E_idx
 
     def sample(self, feature_dict):
         # xyz_37 = feature_dict["xyz_37"] #[B,L,37,3] - xyz coordinates for all atoms if needed
@@ -213,7 +415,7 @@ class ProteinMPNN(torch.nn.Module):
         B, L = S_true.shape
         device = S_true.device
 
-        h_V, h_E, E_idx = self.encode(feature_dict)
+        h_V, h_E, etab, E_idx, S_true, mask, chain_mask, randn = self.encode(feature_dict)
 
         chain_mask = mask * chain_mask  # update chain_M to include missing regions
         decoding_order = torch.argsort(
@@ -489,7 +691,7 @@ class ProteinMPNN(torch.nn.Module):
         B, L = S_true_enc.shape
         device = S_true_enc.device
 
-        h_V_enc, h_E_enc, E_idx_enc = self.encode(feature_dict)
+        h_V_enc, h_E_enc, etab, E_idx_enc, _, _, _, _ = self.encode(feature_dict)
         log_probs_out = torch.zeros([B_decoder, L, 21], device=device).float()
         logits_out = torch.zeros([B_decoder, L, 21], device=device).float()
         decoding_order_out = torch.zeros([B_decoder, L, L], device=device).float()
@@ -577,7 +779,7 @@ class ProteinMPNN(torch.nn.Module):
         B, L = S_true.shape
         device = S_true.device
 
-        h_V, h_E, E_idx = self.encode(feature_dict)
+        h_V, h_E, _, E_idx, _, _, _, _ = self.encode(feature_dict)
 
         chain_mask = mask * chain_mask  # update chain_M to include missing regions
         decoding_order = torch.argsort(
@@ -678,6 +880,7 @@ class ProteinFeaturesLigand(torch.nn.Module):
         device=None,
         atom_context_num=16,
         use_side_chains=False,
+        updated_alist=True
     ):
         """Extract protein features"""
         super(ProteinFeaturesLigand, self).__init__()
@@ -701,11 +904,14 @@ class ProteinFeaturesLigand(torch.nn.Module):
         )
         self.norm_nodes = torch.nn.LayerNorm(node_features)
 
-        self.type_linear = torch.nn.Linear(147, 64)
-
-        self.y_nodes = torch.nn.Linear(147, node_features, bias=False)
+        if updated_alist:
+            self.type_linear = torch.nn.Linear(150, 64)
+            self.y_nodes = torch.nn.Linear(150, node_features, bias=False)
+        else:
+            self.type_linear = torch.nn.Linear(147, 64)
+            self.y_nodes = torch.nn.Linear(147, node_features, bias=False)
+        
         self.y_edges = torch.nn.Linear(num_rbf, node_features, bias=False)
-
         self.norm_y_edges = torch.nn.LayerNorm(node_features)
         self.norm_y_nodes = torch.nn.LayerNorm(node_features)
 
@@ -747,7 +953,6 @@ class ProteinFeaturesLigand(torch.nn.Module):
                 7,
                 8,
             ],
-            device=device,
         )
 
         self.periodic_table_features = torch.tensor(
@@ -1117,8 +1322,12 @@ class ProteinFeaturesLigand(torch.nn.Module):
                 ],
             ],
             dtype=torch.long,
-            device=device,
         )
+
+        if updated_alist:
+            self.periodic_table_features = torch.cat([self.periodic_table_features, torch.tensor([[119, 120], [19, 19], [8, 8]], dtype=torch.long)], dim=-1)
+
+        self.updated_alist = updated_alist
 
     def _make_angle_features(self, A, B, C, Y):
         v1 = A - B
@@ -1256,7 +1465,8 @@ class ProteinFeaturesLigand(torch.nn.Module):
             R = gather_nodes(X_sidechain, E_idx_sub).view(
                 B, L, E_idx_sub.shape[2], -1, 3
             )
-            R_t = self.side_chain_atom_types[None, None, None, :].repeat(
+            side_chain_atom_types = self.side_chain_atom_types.to(device=E.device)
+            R_t = side_chain_atom_types[None, None, None, :].repeat(
                 B, L, E_idx_sub.shape[2], 1
             )
 
@@ -1282,12 +1492,18 @@ class ProteinFeaturesLigand(torch.nn.Module):
             Y_m = torch.gather(Y_m, 2, E_idx_Y)
 
         Y_t = Y_t.long()
-        Y_t_g = self.periodic_table_features[1][Y_t]  # group; 19 categories including 0
-        Y_t_p = self.periodic_table_features[2][Y_t]  # period; 8 categories including 0
+        periodic_table_features = self.periodic_table_features.to(device=Y_t.device)
+        Y_t_g = periodic_table_features[1][Y_t]  # group; 20 categories including 0
+        Y_t_p = periodic_table_features[2][Y_t]  # period; 9 categories including 0
 
-        Y_t_g_1hot_ = torch.nn.functional.one_hot(Y_t_g, 19)  # [B, L, M, 19]
-        Y_t_p_1hot_ = torch.nn.functional.one_hot(Y_t_p, 8)  # [B, L, M, 8]
-        Y_t_1hot_ = torch.nn.functional.one_hot(Y_t, 120)  # [B, L, M, 120]
+        if self.updated_alist:
+            Y_t_g_1hot_ = torch.nn.functional.one_hot(Y_t_g, 20)  # [B, L, M, 20]
+            Y_t_p_1hot_ = torch.nn.functional.one_hot(Y_t_p, 9)  # [B, L, M, 9]
+            Y_t_1hot_ = torch.nn.functional.one_hot(Y_t, 121)  # [B, L, M, 121]
+        else:
+            Y_t_g_1hot_ = torch.nn.functional.one_hot(Y_t_g, 19)  # [B, L, M, 20]
+            Y_t_p_1hot_ = torch.nn.functional.one_hot(Y_t_p, 8)  # [B, L, M, 9]
+            Y_t_1hot_ = torch.nn.functional.one_hot(Y_t, 120)  # [B, L, M, 121]
 
         Y_t_1hot_ = torch.cat(
             [Y_t_1hot_, Y_t_g_1hot_, Y_t_p_1hot_], -1
@@ -1770,3 +1986,178 @@ def cat_neighbors_nodes(h_nodes, h_neighbors, E_idx):
     h_nodes = gather_nodes(h_nodes, E_idx)
     h_nn = torch.cat([h_neighbors, h_nodes], -1)
     return h_nn
+
+
+def loss_nll(S, log_probs, mask):
+    """ Negative log probabilities """
+    S = S.to(dtype=torch.int64)
+    criterion = torch.nn.NLLLoss(reduction='none')
+    loss = criterion(
+        log_probs.contiguous().view(-1, log_probs.size(-1)), S.contiguous().view(-1)
+    ).view(S.size())
+    S_argmaxed = torch.argmax(log_probs,-1) #[B, L]
+    true_false = (S == S_argmaxed).float()
+    loss_av = torch.sum(loss * mask) / torch.sum(mask)
+    return loss, loss_av, true_false
+
+
+def loss_smoothed(S, log_probs, mask, weight=0.1):
+    """ Negative log probabilities """
+    S_onehot = torch.nn.functional.one_hot(S.to(dtype=torch.long), 21).float()
+
+    # Label smoothing
+    S_onehot = S_onehot + weight / float(S_onehot.size(-1))
+    S_onehot = S_onehot / S_onehot.sum(-1, keepdim=True)
+
+    loss = -(S_onehot * log_probs).sum(-1)
+    loss_av = torch.sum(loss * mask) / 2000.0 #fixed 
+
+    if loss_av.isnan().item():
+        print("LOSS SMOOTHED ALARM")
+        # print(log_probs)
+        # print(S)
+        print('log loss: ', log_probs.sum(), torch.isnan(log_probs).any(), log_probs.shape)
+        raise ValueError
+        loss_av = torch.Tensor([0])
+        loss = None
+
+    return loss, loss_av
+
+def nlcpl(etab, E_idx, S, mask):
+    """ Negative log composite psuedo-likelihood
+        Averaged nlcpl per residue, across batches
+        p(a_i,m ; a_j,n) =
+            softmax [
+                E_s(a_i,m) + E_s(a_j,n)
+                + E_p(a_i,m ; a_j,n)
+                + sum_(u != m,n) [
+                    E_p(a_i,m; A_u)
+                    + E_p(A_u, a_j,n)
+                    ]
+                ]
+
+        Returns: log likelihoods per residue, as well as tensor mask
+    """
+    ref_seqs = S.to(dtype=torch.int64)
+    x_mask = mask
+
+    n_batch, L, k, _ = etab.shape
+    etab = etab.unsqueeze(-1).view(n_batch, L, k, 20, 20)
+
+    # X is encoded as 20 so lets just add an extra row/col of zeros
+    pad = (0, 2, 0, 2)
+    etab = F.pad(etab, pad, "constant", 0)
+
+    isnt_x_aa = (torch.logical_and(ref_seqs != 20, ref_seqs != 21)).float() # b x L
+
+    # separate selfE and pairE since we have to treat selfE differently
+    self_etab = etab[:, :, 0:1] # b x L x 1 x 22 x 22
+    pair_etab = etab[:, :, 1:] # b x L x 29 x 22 x 22
+
+    # gather 22 self energies by taking the diagonal of the etab
+    self_nrgs_im = torch.diagonal(self_etab, offset=0, dim1=-2, dim2=-1) # b x L x 1 x 22
+    self_nrgs_im_expand = self_nrgs_im.expand(-1, -1, k - 1, -1) # b x L x 29 x 22
+
+    # E_idx for all but self
+    E_idx_jn = E_idx[:, :, 1:] # b x L x 29
+
+    # self Es gathered from E_idx_others
+    E_idx_jn_expand = E_idx_jn.unsqueeze(-1).expand(-1, -1, -1, 22) # b x L x 29 x 22
+    self_nrgs_jn = torch.gather(self_nrgs_im_expand, 1, E_idx_jn_expand) # b x L x 29 x 22
+
+    # idx matrix to gather the identity at all other residues given a residue of focus
+    E_aa = torch.gather(ref_seqs.unsqueeze(-1).expand(-1, -1, k - 1), 1, E_idx_jn) # b x L x 29
+    # expand the matrix so we can gather pair energies
+    E_aa = E_aa.view(list(E_idx_jn.shape) + [1, 1]).expand(-1, -1, -1, 22, -1) # b x L x 29 x 22 x 1
+    # gather the 22 energies for each edge based on E_aa
+    pair_nrgs_jn = torch.gather(pair_etab, 4, E_aa).squeeze(-1) # b x L x 29 x 22
+    # sum_(u != n,m) E_p(a_i,n; A_u)
+    sum_pair_nrgs_jn = torch.sum(pair_nrgs_jn, dim=2) # b x L x 22
+    pair_nrgs_im_u = sum_pair_nrgs_jn.unsqueeze(2).expand(-1, -1, k - 1, -1) - pair_nrgs_jn # b x L x 29 x 22
+
+    # get pair_nrgs_u_jn from pair_nrgs_im_u
+    E_idx_imu_to_ujn = E_idx_jn.unsqueeze(-1).expand(pair_nrgs_im_u.shape) # b x L x 29 x 22
+    pair_nrgs_u_jn = torch.gather(pair_nrgs_im_u, 1, E_idx_imu_to_ujn) # b x L x 29 x 22
+
+    # start building this wacky energy table
+    self_nrgs_im_expand = self_nrgs_im_expand.unsqueeze(-1).expand(-1, -1, -1, -1, 22) # b x L x 29 x 22 x 22
+    self_nrgs_jn_expand = self_nrgs_jn.unsqueeze(-1).expand(-1, -1, -1, -1, 22).transpose(-2, -1) # b x L x 29 x 22 x 22
+    pair_nrgs_im_expand = pair_nrgs_im_u.unsqueeze(-1).expand(-1, -1, -1, -1, 22) # b x L x 29 x 22 x 22
+    pair_nrgs_jn_expand = pair_nrgs_u_jn.unsqueeze(-1).expand(-1, -1, -1, -1, 22).transpose(-2, -1) # b x L x 29 x 22 x 22
+
+    composite_nrgs = (self_nrgs_im_expand + self_nrgs_jn_expand + pair_etab + pair_nrgs_im_expand +
+                      pair_nrgs_jn_expand) # b x L x 29 x 21 x 21
+
+    # convert energies to probabilities
+    composite_nrgs_reshape = composite_nrgs.view(n_batch, L, k - 1, 22 * 22, 1) # b x L x 29 x 484 x 1
+    log_composite_prob_dist = torch.log_softmax(-composite_nrgs_reshape, dim=-2).view(n_batch, L, k - 1, 22, 22) # b x L x 29 x 22 x 22
+    # get the probability of the sequence
+    im_probs = torch.gather(log_composite_prob_dist, 4, E_aa).squeeze(-1) # b x L x 29 x 22
+    ref_seqs_expand = ref_seqs.view(list(ref_seqs.shape) + [1, 1]).expand(-1, -1, k - 1, 1) # b x L x 29 x 1
+    log_edge_probs = torch.gather(im_probs, 3, ref_seqs_expand).squeeze(-1) # b x L x 29
+
+    # reshape masks
+    x_mask = x_mask.unsqueeze(-1) # b x L x 1
+    isnt_x_aa = isnt_x_aa.unsqueeze(-1) # b x L x 1
+    full_mask = x_mask * isnt_x_aa
+    
+    # convert to nlcpl
+    log_edge_probs *= full_mask  # zero out positions that don't have residues or where the native sequence is X
+    
+    n_edges = torch.sum(full_mask.expand(log_edge_probs.shape))
+    nlcpl_return = -1*torch.sum(log_edge_probs) / n_edges
+
+    if nlcpl_return.isnan().item():
+        print("ALARM")
+        # print(nlcpl_return)
+        # for i in range(data['x_mask_sc'].shape[0]):
+        #     print('\t', torch.sum((1 -(data['x_mask_sc'][i])) * (mask[i])).item())
+        #     print('\t', torch.sum((1 -(data['x_mask_sc'][i])) * (mask[i]) * (isnt_x_aa[i,:,0])).item())
+        # print(n_edges)
+        # print(data['ids'])
+        # print(data['X'].shape, data['x_mask_sc'].shape)
+        # print(S)
+        nlcpl_return = torch.Tensor([0])
+        return nlcpl_return, -2
+
+    return nlcpl_return, int(n_edges)
+
+class NoamOpt:
+    "Optim wrapper that implements rate."
+    def __init__(self, model_size, factor, warmup, optimizer, step):
+        self.optimizer = optimizer
+        self._step = step
+        self.warmup = warmup
+        self.factor = factor
+        self.model_size = model_size
+        self._rate = 0
+
+    @property
+    def param_groups(self):
+        """Return param_groups."""
+        return self.optimizer.param_groups
+
+    def step(self):
+        "Update parameters and rate"
+        self._step += 1
+        rate = self.rate()
+        for p in self.optimizer.param_groups:
+            p['lr'] = rate
+        self._rate = rate
+        self.optimizer.step()
+
+    def rate(self, step = None):
+        "Implement `lrate` above"
+        if step is None:
+            step = self._step
+        return self.factor * \
+            (self.model_size ** (-0.5) *
+            min(step ** (-0.5), step * self.warmup ** (-1.5)))
+
+    def zero_grad(self):
+        self.optimizer.zero_grad()
+
+def get_std_opt(parameters, d_model, step):
+    return NoamOpt(
+        d_model, 2, 4000, torch.optim.Adam(parameters, lr=0, betas=(0.9, 0.98), eps=1e-9), step
+    )
