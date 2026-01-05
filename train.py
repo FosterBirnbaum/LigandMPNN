@@ -255,64 +255,8 @@ def main(rank, world_size, args):
 
             optimizer.zero_grad()
 
-            if False and args.mixed_precision:
+            if args.mixed_precision:
                 with torch.cuda.amp.autocast():
-
-                    # set the number of checkpoint segments
-                    # segments = 2
-
-                    # get the modules in the model. These modules should be in the order
-                    # the model should be executed
-                    # modules = [module for k, module in model._modules.items()]
-                    # functions = [model.encode, model.decode]
-                    # segments = 2
-
-                    # encoded = cp.checkpoint(lambda fdict: model.encode(fdict), feature_dict)
-                    # log_probs, etab, E_idx = cp.checkpoint(lambda enc: model.decode(enc), encoded)
-
-                    # # Helper to flatten multiple tensors into a single tensor
-                    # def flatten_outputs(outputs):
-                    #     return torch.cat([t.contiguous().view(-1) for t in outputs])
-
-                    # # Helper to reconstruct tensors from flat vector
-                    # def reconstruct(flat_tensor, templates):
-                    #     sizes = [t.numel() for t in templates]
-                    #     outputs = []
-                    #     offset = 0
-                    #     for size, t in zip(sizes, templates):
-                    #         out = flat_tensor[offset:offset + size].view_as(t)
-                    #         outputs.append(out)
-                    #         offset += size
-                    #     return tuple(outputs)
-
-                    # # Encode + flatten for checkpointing
-                    # def encode_and_flatten(inputs):
-                    #     outputs = model.encode(inputs)
-                    #     return flatten_outputs(outputs)
-
-                    # flat_encoded = checkpoint(encode_and_flatten, feature_dict)
-
-                    # # Reconstruct encoded tensors using non-grad version
-                    # with torch.no_grad():
-                    #     enc_template = model.encode(feature_dict)
-                    # reconstructed_enc = reconstruct(flat_encoded, enc_template)
-
-                    # # Decode + flatten
-                    # def decode_and_flatten(*encoded_tensors):
-                    #     outputs = model.decode(encoded_tensors)
-                    #     return flatten_outputs(outputs)
-
-                    # flat_decoded = checkpoint(lambda *x: decode_and_flatten(*x), *reconstructed_enc)
-
-                    # # Reconstruct decode outputs
-                    # with torch.no_grad():
-                    #     dec_template = model.decode(enc_template)
-                    # log_probs, etab, E_idx = reconstruct(flat_decoded, dec_template)
-
-                    # encoded = checkpoint_multiple_outputs(model.encode, feature_dict)
-                    # log_probs, etab, E_idx = checkpoint_multiple_outputs(model.decode, encoded)
-                    # now call the checkpoint API and get the output
-                    # log_probs, etab, E_idx = checkpoint_sequential(functions, segments, feature_dict, use_reentrant=False)
                     try:
                         log_probs, etab, E_idx = model(feature_dict)
                     
@@ -357,16 +301,8 @@ def main(rank, world_size, args):
                     total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.gradient_norm)
 
                 optimizer.step()
-        # allocated = torch.cuda.memory_allocated(device)
-        # reserved = torch.cuda.memory_reserved(device)
-        # max_allocated = torch.cuda.max_memory_allocated(device)
-        # print(f"[Batch {i_train_batch}] Allocated: {allocated:.2f} MB, Reserved: {reserved:.2f} MB, Max Allocated: {max_allocated:.2f} MB")
-        # torch.cuda.reset_peak_memory_stats(device)
         
             loss, loss_av, true_false = loss_nll(S_true, log_probs, mask_for_loss)
-            # if args.etab_loss:
-            #     nlcpl_loss, _ = nlcpl(etab, E_idx, S_true, mask)
-            #     nlcpl_train_sum += nlcpl_loss.cpu().item()
         
             train_sum += torch.sum(loss * mask_for_loss).cpu().data.numpy()
             train_acc += torch.sum(true_false * mask_for_loss).cpu().data.numpy()
@@ -380,64 +316,6 @@ def main(rank, world_size, args):
                 progress.update(10)
                 progress.refresh()
                 progress.set_description_str(f'avg loss {str_loss} | acc {str_acc}')
-
-        # except Exception as err:
-        #     # with torch.cuda.amp.autocast(dtype=torch.bfloat16):
-        #     #     log_probs2, etab, E_idx = model(feature_dict)
-        #     #     print('log probs 0: ', log_probs2.sum(), torch.isnan(log_probs2).any())
-        #     # # for k, v in feature_dict.items():
-        #     # #     if torch.is_tensor(v):
-        #     # #         print(k, v.shape)
-        #     print(feature_dict['filepaths'])
-        #     log_probs, etab, E_idx = model(feature_dict)
-        #     print('log probs 1: ', log_probs.sum(), torch.isnan(log_probs).any())
-        #     # str_rank = str(rank)
-        #     # checkpoint_filename_last = base_folder+f'model_weights/epoch_error_rank{str_rank}.pt'
-        #     # torch.save({
-        #     #         'epoch': e+1,
-        #     #         'step': total_step,
-        #     #         'num_edges' : args.num_neighbors,
-        #     #         'noise_level': args.backbone_noise,
-        #     #         'noise_type': args.noise_type,
-        #     #         'model_state_dict': model.state_dict(),
-        #     #         'optimizer_state_dict': optimizer.optimizer.state_dict(),
-        #     #         }, checkpoint_filename_last)
-            
-        #     # model = model.eval()
-        #     # with torch.no_grad():
-        #     #     log_probs, etab, E_idx = model(feature_dict)
-        #     #     try:
-        #     #         loss, loss_av, true_false = loss_nll(S_true, log_probs, mask_for_loss)
-        #     #     except Exception as err2:
-        #     #         print(err2)
-        #     # print('nll loss:')
-        #     # print(loss.sum())
-        #     # print(loss_av)
-        #     # print(torch.isnan(loss).any())
-        #     # print('log probs 2: ', log_probs.sum(), torch.isnan(log_probs).any())
-        #     # try:
-        #     #     loss_calc, loss_av_smoothed = loss_smoothed(S_true, log_probs, mask_for_loss)
-        #     #     print("SUCCESS!")
-        #     # except Exception as err3:
-        #     #     S_onehot = torch.nn.functional.one_hot(S_true.to(dtype=torch.long), 21).float()
-
-        #     #     # Label smoothing
-        #     #     weight=0.1
-        #     #     S_onehot = S_onehot + weight / float(S_onehot.size(-1))
-        #     #     S_onehot = S_onehot / S_onehot.sum(-1, keepdim=True)
-
-        #     #     loss_calc = -(S_onehot * log_probs).sum(-1)
-        #     #     loss_av_smoothed = torch.sum(loss * mask) / 2000.0 #fixed 
-        #     #     print(err3)
-        #     #     raise err3
-        #     # print('t2: ', loss_calc.sum(), torch.isnan(loss_calc).any(), loss_av_smoothed)
-        #     # print('lc shape: ', loss_calc.shape)
-        #     # model = model.train()
-        #     # log_probs, etab, E_idx = model(feature_dict)
-        #     # print('log probs 3: ', log_probs.sum(), torch.isnan(log_probs).any())
-        #     # loss_calc, loss_av_smoothed = loss_smoothed(S_true, log_probs, mask_for_loss)
-            
-        #     raise err
         
         if rank == 0:
             progress.close()
@@ -567,7 +445,7 @@ if __name__ == "__main__":
     argparser.add_argument("--rescut", type=float, default=3.5, help="PDB resolution cutoff")
     argparser.add_argument("--debug", type=bool, default=False, help="minimal data loading for debugging")
     argparser.add_argument("--gradient_norm", type=float, default=-1.0, help="clip gradient norm, set to negative to omit clipping")
-    argparser.add_argument("--mixed_precision", type=bool, default=True, help="train with mixed precision")
+    argparser.add_argument("--mixed_precision", type=bool, default=False, help="train with mixed precision")
     argparser.add_argument("--replicate", type=int, default=1, help='replicate to use in setting seed for noise')
     argparser.add_argument("--feat_type", type=str, default="protein_mpnn", help="type of featurizer to use")
     argparser.add_argument("--etab_loss", type=int, default=0, help="whether to use Potts model loss")

@@ -809,9 +809,9 @@ def parse_PDB(
         protein_atoms = atoms.select("protein")
         backbone = protein_atoms.select("backbone")
     except Exception as e:
-        # with open('/orcd/scratch/orcd/001/fosterb/pmpnn_experiments/ligandmpnn_potts_nomixed/log_error.out', 'a') as f:
-        #     f.write(str(input_path) + '\n')
-        #     f.write(str(e) + '\n')
+        with open('/orcd/scratch/orcd/001/fosterb/pmpnn_experiments/ligandmpnn_potts_nomixed/log_error.out', 'a') as f:
+            f.write(str(input_path) + '\n')
+            f.write(str(e) + '\n')
         return None, None, None, None, None
     other_atoms = atoms.select("not protein and not water")
     water_atoms = atoms.select("water")
@@ -885,8 +885,8 @@ def parse_PDB(
         Y_t = np.zeros([1], np.int32)
         Y_m = np.zeros([1], np.int32)
     if Y.shape[0] == 0:
-        # with open('/orcd/scratch/orcd/001/fosterb/pmpnn_experiments/ligandmpnn_potts_nomixed/data_err.txt', 'a') as f:
-        #     f.write(str(input_path) + '\n')
+        with open('/orcd/scratch/orcd/001/fosterb/pmpnn_experiments/ligandmpnn_potts_nomixed/data_err.txt', 'a') as f:
+            f.write(str(input_path) + '\n')
         Y = np.zeros([1, 3], np.float32)
         Y_t = np.zeros([1], np.int32)
         Y_m = np.zeros([1], np.int32)
@@ -1118,14 +1118,14 @@ def featurize(
                     CB, mask, Y, Y_t, Y_m, number_of_ligand_atoms
                 )
             except Exception as e:
-                # with open('/orcd/scratch/orcd/001/fosterb/pmpnn_experiments/ligandmpnn_potts_nomixed/test2.out', 'w') as f:
-                #     f.write(str(Y.shape) + ' ' + str(Y_t.shape) + ' ' + str(Y_m.shape) + ' ' + str(mask.shape) + ' ' + str(CB.shape) + '\n')
-                #     f.write(str(Y) + '\n')
-                #     f.write(str(Y_t) + '\n')
-                #     f.write(str(Y_m) + '\n')
-                #     f.write(str(e) + '\n')
-                #     f.write(str(output_dict['filepath']))
-                raise e
+                with open('/orcd/scratch/orcd/001/fosterb/pmpnn_experiments/ligandmpnn_potts_nomixed/test2.out', 'w') as f:
+                    f.write(str(Y.shape) + ' ' + str(Y_t.shape) + ' ' + str(Y_m.shape) + ' ' + str(mask.shape) + ' ' + str(CB.shape) + '\n')
+                    f.write(str(Y) + '\n')
+                    f.write(str(Y_t) + '\n')
+                    f.write(str(Y_m) + '\n')
+                    f.write(str(e) + '\n')
+                    f.write(str(output_dict['filepath']))
+                    raise e
             mask_XY = (D_XY < cutoff_for_score) * mask * Y_m[:, 0]
             output_dict["mask_XY"] = mask_XY
             if "side_chain_mask" in list(input_dict):

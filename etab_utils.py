@@ -344,7 +344,6 @@ def stability_loss_loop_ddg(base_etab, E_idx, data, max_tokens=20000, use_sc_mas
     # Normalize to WT
     predicted_E = predicted_E[1:] - predicted_E[0]
     ref_energies = ref_energies[1:]
-    all_seqs = all_seqs[1:]
 
     # Normalize values around 0 for pearson correlation calculation
     norm_pred = predicted_E - torch.mean(predicted_E) # n
