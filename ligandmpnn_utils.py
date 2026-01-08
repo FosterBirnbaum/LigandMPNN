@@ -1,6 +1,5 @@
 import pandas as pd
 import pickle
-import webdataset as wds
 import os
 import torch
 import numpy as np
