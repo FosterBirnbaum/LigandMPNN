@@ -4,7 +4,11 @@ import webdataset as wds
 import os
 import torch
 import numpy as np
-from data_utils import parse_PDB, get_nearest_neighbours, alphabet
+import copy
+from collections import defaultdict
+import json
+import omegaconf
+from data_utils import parse_PDB, parse_PDB_seq_only, get_nearest_neighbours, alphabet
 from model_utils import nlcpl
 
 checkpoints = {
@@ -306,3 +310,174 @@ def get_log_probs(input_pdb, chain_list, model, device, ligand_mpnn_use_side_cha
         nlcpl_loss = np.nan
         
     return log_probs, nlll_loss, nsr, etab, E_idx, nlcpl_loss
+
+def is_float(s):
+    """
+    Checks if the input string 's' can be converted to a float.
+    Returns the converted float if it can, None otherwise.
+    """
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+def process_data(cfg):
+    """
+    Process data settings for energy prediction.
+
+    Parameters
+    ----------
+    cfg : OmegaConf object
+
+    Returns
+    -------
+    dataset_settings : dict of dicts
+        Processed dataset settings per pdb
+    chain_lens_dicts : dict of lists
+        Chain lengths per pdb
+    pdb_list : list of pdb names
+    binding_energy_chains : None or dict of chain list pairs for binding energy calculation
+
+    """
+    # Get pdb info
+    with open(cfg.input_list, 'r') as f:
+        pdb_list = f.readlines()
+    pdb_list = [line.strip() for line in pdb_list]
+
+    # If predicting binding energies, load information about chain separation
+    if cfg.inference.binding_energy_json:
+        if type(cfg.inference.binding_energy_json) in [dict, omegaconf.dictconfig.DictConfig]:
+            binding_energy_chains = cfg.inference.binding_energy_json
+        else:
+            with open(cfg.inference.binding_energy_json, 'r') as f:
+                binding_energy_chains = json.load(f)
+            for pdb in pdb_list:
+                if not pdb in binding_energy_chains:
+                    binding_energy_chains[pdb] = None
+    else:
+        binding_energy_chains = None
+
+    # Set up data structures
+    mutant_data = {'pdb': [], 'sequences': [], 'partitioned_sequences': [], 'ddG_expt': [], 'mut_chains': []}
+    chain_lens_dicts = {}
+    mut_alphabet = 'ACDEFGHIKLMNPQRSTVWY'
+    # Load mutant sequence information
+    if cfg.mutant_fasta is not None: # Predict energies for provided mutant sequences from a FASTA file
+        with open(cfg.mutant_fasta, 'r') as f:
+            mutant_seq_lines = f.readlines()
+        mutant_seqs = defaultdict(list)
+        for pdb, line in zip(mutant_seq_lines[::2], mutant_seq_lines[1::2]):
+            mutant_seqs[pdb.strip().split('|')[0].strip('>')].append((pdb.strip(), line.strip()))
+
+        for pdb in pdb_list:
+            # Gather information about wild-type sequence
+            wt_info = parse_PDB_seq_only(os.path.join(cfg.input_dir, pdb + '.pdb'), skip_gaps=cfg.inference.skip_gaps)
+            for header, seq in mutant_seqs[pdb]:
+                header = header.strip('>')
+                # Parse mutant sequence header
+                header_parts = header.split('|')
+                assert len(header_parts) <= 3, "Header information cannot exceed 3 '|' parts"
+                mut_chains = None
+                ddG_expt = None
+                if len(header_parts) == 2:
+                    ddG_expt = is_float(header_parts[1])
+                    if not ddG_expt:
+                        mut_chains = header_parts[1]
+                elif len(header_parts) == 3:
+                    mut_chains = header_parts[1]
+                    ddG_expt = is_float(header_parts[2])
+                if not ddG_expt: ddG_expt = np.nan
+
+                # Create full mutant sequence
+                mut_seq = []
+                if mut_chains: # If chain info in header, processes provided sequence accordingly
+                    mut_chains = mut_chains.split(':')
+                else: # Assume mutant sequence provided has all chains present
+                    assert len(wt_info['chain_order']) == len(seq.split(':')), "If chains not specified, mutant sequence must contain information on all chains"
+                    mut_chains = wt_info['chain_order']
+                mut_seq_dict = {chain: chain_seq for chain, chain_seq in zip(mut_chains, seq.split(':'))}
+
+                for chain in wt_info['chain_order']:
+                    if chain in mut_seq_dict: # Use mutant sequence
+                        assert len(mut_seq_dict[chain]) == len(wt_info[f'seq_chain_{chain}']), "Mutant sequence length must match wildtype sequence length"
+                        # Check mutant seq to ensure mutations are all canonical amino acids
+                        for wc, mc in zip(wt_info[f'seq_chain_{chain}'], mut_seq_dict[chain]):
+                            if wc != mc: assert mc in mut_alphabet, "Mutation must be one of 20 canonical amino acids"
+                        mut_seq.append((chain, mut_seq_dict[chain]))
+                    else: # Use wildtype sequence
+                        mut_seq.append((chain, wt_info[f'seq_chain_{chain}']))
+                mutant_data['pdb'].append(pdb)
+                mutant_data['sequences'].append(mut_seq)
+                mutant_data['ddG_expt'].append(ddG_expt)
+                mutant_data['mut_chains'].append(':'.join(mut_chains))
+            chain_lens_dicts[pdb] = {chain: len(chain_seq) for chain, chain_seq in mutant_data['sequences'][-1]}
+
+    elif cfg.mutant_csv is not None: # Predict energies for provided mutant sequences from a CSV file
+        mutant_df = pd.read_csv(cfg.mutant_csv)
+        assert all(col in mutant_df.columns for col in ['pdb', 'chain', 'mut_type']), "CSV must contain 'pdb', 'chain', and 'mut_type' columns"
+        if not 'ddG_expt' in mutant_df.columns:
+            mutant_df['ddG_expt'] = [np.nan] * len(mutant_df)
+        for pdb in mutant_df['pdb'].unique():
+            pdb_df = mutant_df[mutant_df['pdb'] == pdb]
+            wt_info = parse_PDB_seq_only(os.path.join(cfg.input_dir, pdb + '.pdb'), skip_gaps=cfg.inference.skip_gaps)
+            for chain_list, mut_type_list, ddG_expt in zip(pdb_df['chain'], pdb_df['mut_type'], pdb_df['ddG_expt']):
+                mut_type_dict = defaultdict(list)
+                for chain, mut_type in zip(chain_list.split(':'), mut_type_list.split(':')):
+                    mut_type_dict[chain].append(mut_type)
+                mut_seq = []
+                for chain in wt_info['chain_order']:
+                    mut_chain = copy.deepcopy(wt_info[f'seq_chain_{chain}'])
+                    if len(mut_type_dict[chain]) > 0: # Use mutant sequence
+                        for mut_type in mut_type_dict[chain]:
+                            wt, pos, mut = mut_type[0], int(mut_type[1:-1]), mut_type[-1]
+                            assert wt == mut_chain[pos], "Mutation information must match wildtype sequence at the mutation position"
+                            assert mut in mut_alphabet, "Mutation must be one of 20 canonical amino acids"
+                            mut_chain = mut_chain[:pos] + mut + mut_chain[pos+1:]
+                        mut_seq.append((chain, mut_chain))
+                    else: # Use wildtype sequence
+                        mut_seq.append((chain, wt_info[f'seq_chain_{chain}']))
+                mutant_data['pdb'].append(pdb)
+                mutant_data['sequences'].append(mut_seq)
+                mutant_data['ddG_expt'].append(ddG_expt)
+                mutant_data['mut_chains'].append(chain_list)
+            chain_lens_dicts[pdb] = {chain: len(chain_seq) for chain, chain_seq in mutant_data['sequences'][-1]}
+
+    else: # Do a DMS screen of all single mutants
+        for pdb in pdb_list:
+            wt_info = parse_PDB_seq_only(os.path.join(cfg.input_dir, pdb + '.pdb'), skip_gaps=cfg.inference.skip_gaps)
+            wt_chains = [(chain, wt_info[f'seq_chain_{chain}']) for chain in wt_info['chain_order']]
+            for i_chain, chain in enumerate(wt_info['chain_order']):
+                mut_seq = ""
+                for i, wtAA in enumerate(wt_info[f'seq_chain_{chain}']):
+                    if wtAA != '-':
+                        for mutAA in mut_alphabet:
+                            if mutAA != wtAA:
+                                mut_seq = copy.deepcopy(wt_info[f'seq_chain_{chain}'])
+                                mut_seq = mut_seq[:i] + mutAA + mut_seq[i+1:]
+                                mutant_data['pdb'].append(pdb)
+                                full_mut_seq = copy.deepcopy(wt_chains)
+                                full_mut_seq[i_chain] = (chain, mut_seq)
+                                mutant_data['sequences'].append(full_mut_seq)
+                                mutant_data['ddG_expt'].append(np.nan)
+                                mutant_data['mut_chains'].append(chain)
+            chain_lens_dicts[pdb] = {chain: len(chain_seq) for chain, chain_seq in mutant_data['sequences'][-1]}
+
+    if binding_energy_chains: # Split sequences into separate chains if requested for binding prediction
+        for pdb, seq in zip(mutant_data['pdb'], mutant_data['sequences']):
+            assert pdb in binding_energy_chains.keys(), "To calculate binding energies, chain partition information must be present for each structure"
+            all_chains = []
+            for partition in binding_energy_chains[pdb]:
+                all_chains += partition
+            assert sorted(all_chains) == sorted([chain for chain, _ in mutant_data['sequences'][0]]), "Chain partitions must include all chains in structure"
+            partitioned_sequences = []
+            for partition in binding_energy_chains[pdb]:
+                partitioned_sequences.append("".join([chain_seq for chain, chain_seq in seq if chain in partition]))
+            mutant_data['partitioned_sequences'].append(partitioned_sequences)
+    else:
+        mutant_data['partitioned_sequences'] = [None] * len(mutant_data['sequences'])
+
+    # Save mutant sequences and energies to tensors
+    for i_mut in range(len(mutant_data['sequences'])):
+        mutant_data['sequences'][i_mut] = "".join([chain_seq for _, chain_seq in mutant_data['sequences'][i_mut]])
+    
+    return pd.DataFrame(mutant_data), chain_lens_dicts, pdb_list, binding_energy_chains

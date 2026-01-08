@@ -876,17 +876,10 @@ def parse_PDB(
         Y_t = Y_t[Y_m]
         Y_m = Y_m[Y_m]
     except Exception as e:
-        # if epoch == 0:
-        #     with open('/orcd/scratch/orcd/001/fosterb/pmpnn_experiments/ligandmpnn_potts_nomixed/data_err.txt', 'a') as f:
-        #         f.write(str(input_path) + '\n')
-        #         f.write(str(e) + '\n')
-        # return None, None, None, None, None
         Y = np.zeros([1, 3], np.float32)
         Y_t = np.zeros([1], np.int32)
         Y_m = np.zeros([1], np.int32)
     if Y.shape[0] == 0:
-        with open('/orcd/scratch/orcd/001/fosterb/pmpnn_experiments/ligandmpnn_potts_nomixed/data_err.txt', 'a') as f:
-            f.write(str(input_path) + '\n')
         Y = np.zeros([1, 3], np.float32)
         Y_t = np.zeros([1], np.int32)
         Y_m = np.zeros([1], np.int32)
@@ -937,6 +930,91 @@ def parse_PDB(
 
     return output_dict, backbone, other_atoms, CA_icodes, water_atoms
 
+def parse_PDB_biounits_seq_only(x, chain=None, skip_gaps=False):
+  '''
+  input:  x = PDB filename
+  output: sequence
+  '''
+
+  alpha_1 = list("ARNDCQEGHILKMFPSTWYV-")
+  alpha_3 = ['ALA','ARG','ASN','ASP','CYS','GLN','GLU','GLY','HIS','ILE',
+             'LEU','LYS','MET','PHE','PRO','SER','THR','TRP','TYR','VAL','GAP']
+  
+  aa_3_N = {a:n for n,a in enumerate(alpha_3)}
+  aa_N_1 = {n:a for n,a in enumerate(alpha_1)}
+  
+  def N_to_AA(x):
+    # [[0,1,2,3]] -> ["ARND"]
+    x = np.array(x);
+    if x.ndim == 1: x = x[None]
+    return ["".join([aa_N_1.get(a,"-") for a in y]) for y in x]
+
+  seq,min_resn,max_resn = {},1e6,-1e6
+  for line in open(x,"rb"):
+    line = line.decode("utf-8","ignore").rstrip()
+
+    if line[:6] == "HETATM" and line[17:17+3] == "MSE":
+      line = line.replace("HETATM","ATOM  ")
+      line = line.replace("MSE","MET")
+
+    if line[:4] == "ATOM":
+      ch = line[21:22]
+      if ch == chain or chain is None:
+        resi = line[17:17+3]
+        resn = line[22:22+5].strip()
+
+        if resn[-1].isalpha(): 
+            resa,resn = resn[-1],int(resn[:-1])-1
+        else: 
+            resa,resn = "",int(resn)-1
+#         resn = int(resn)
+        if resn < min_resn: 
+            min_resn = resn
+        if resn > max_resn: 
+            max_resn = resn
+        if resn not in seq: 
+            seq[resn] = {}
+        if resa not in seq[resn]: 
+            seq[resn][resa] = resi
+
+  # convert to numpy arrays, fill in missing values
+  seq_ = []
+  try:
+      for resn in range(min_resn,max_resn+1):
+        if resn in seq:
+          for k in sorted(seq[resn]): seq_.append(aa_3_N.get(seq[resn][k],20))
+        else:
+            if skip_gaps:
+                continue
+            seq_.append(20)
+      return N_to_AA(np.array(seq_))
+  except TypeError:
+      return 'no_chain'
+
+def parse_PDB_seq_only(path_to_pdb, input_chain_list=None, ca_only=False, skip_gaps=False):
+    init_alphabet = ['A', 'B', 'C', 'D', 'E', 'F', 'G','H', 'I', 'J','K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T','U', 'V','W','X', 'Y', 'Z', 'a', 'b', 'c', 'd', 'e', 'f', 'g','h', 'i', 'j','k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't','u', 'v','w','x', 'y', 'z']
+    extra_alphabet = [str(item) for item in list(np.arange(300))]
+    chain_alphabet = init_alphabet + extra_alphabet
+     
+    if input_chain_list:
+        chain_alphabet = input_chain_list  
+
+    my_dict = {}
+    chain_order = []
+    concat_seq = ''
+    for letter in chain_alphabet:
+        seq = parse_PDB_biounits_seq_only(path_to_pdb, chain=letter, skip_gaps=skip_gaps)
+        if type(seq) != str:
+            concat_seq += seq[0]
+            my_dict['seq_chain_'+letter]=seq[0]
+            chain_order.append(letter)
+    fi = path_to_pdb.rfind("/")
+    my_dict['name']=path_to_pdb[(fi+1):-4]
+    my_dict['num_of_chains'] = len(chain_order)
+    my_dict['seq'] = concat_seq
+    my_dict['chain_order'] = chain_order
+
+    return my_dict
 
 def get_nearest_neighbours(CB, mask, Y, Y_t, Y_m, number_of_ligand_atoms):
     device = CB.device
