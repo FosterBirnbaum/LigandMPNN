@@ -320,13 +320,14 @@ def is_float(s):
     except ValueError:
         return None
 
-def process_data(cfg):
+def process_data(cfg, pdb_list):
     """
     Process data settings for energy prediction.
 
     Parameters
     ----------
     cfg : OmegaConf object
+    pdb_list : list of pdb names
 
     Returns
     -------
@@ -338,10 +339,6 @@ def process_data(cfg):
     binding_energy_chains : None or dict of chain list pairs for binding energy calculation
 
     """
-    # Get pdb info
-    with open(cfg.input_list, 'r') as f:
-        pdb_list = f.readlines()
-    pdb_list = [line.strip() for line in pdb_list]
 
     # If predicting binding energies, load information about chain separation
     if cfg.inference.binding_energy_json:
