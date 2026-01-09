@@ -468,6 +468,27 @@ def calc_eners(etab, E_idx, seqs, nrgs, filter=True):
         return batch_pred_E, seqs, nrgs
     else:
         return batch_scores, seqs, nrgs
+    
+
+def functionalize_etab(etab, E_idx):
+    """
+    Prepare etab for energy prediction.
+
+    Args
+    ----
+    etab : torch.Tensor
+        Energy table with shape `[B, L, k, h]`
+    E_idx : torch.Tensor
+        Neighbor indices used to lookup pair contributions.
+
+    Returns
+    -------
+    torch.Tensor, shape (B, L, k, h, h)
+        Energy table ready for energy prediction.
+    """
+    etab = merge_duplicate_pairE(etab, E_idx, denom=4)
+    etab = etab.view(etab.shape[0], etab.shape[1], etab.shape[2], int(np.sqrt(etab.shape[3])), int(np.sqrt(etab.shape[3])))
+    return etab
 
 # zero is used as padding
 AA_to_int = {
