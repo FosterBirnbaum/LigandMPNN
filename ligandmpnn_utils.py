@@ -359,6 +359,7 @@ def process_data(cfg, pdb_list):
     chain_lens_dicts = {}
     mut_alphabet = 'ACDEFGHIKLMNPQRSTVWY'
     wt_seqs = {}
+    partitioned_wt_seqs = {}
     # Load mutant sequence information
     if cfg.mutant_fasta is not None: # Predict energies for provided mutant sequences from a FASTA file
         with open(cfg.mutant_fasta, 'r') as f:
@@ -388,6 +389,7 @@ def process_data(cfg, pdb_list):
 
                 # Create full mutant sequence
                 mut_seq = []
+                wt_seq = []
                 if mut_chains: # If chain info in header, processes provided sequence accordingly
                     mut_chains = mut_chains.split(':')
                 else: # Assume mutant sequence provided has all chains present
@@ -404,12 +406,13 @@ def process_data(cfg, pdb_list):
                         mut_seq.append((chain, mut_seq_dict[chain]))
                     else: # Use wildtype sequence
                         mut_seq.append((chain, wt_info[f'seq_chain_{chain}']))
+                    wt_seq.append((chain, wt_info[f'seq_chain_{chain}']))
                 mutant_data['pdb'].append(pdb)
                 mutant_data['sequences'].append(mut_seq)
                 mutant_data['ddG_expt'].append(ddG_expt)
                 mutant_data['mut_chains'].append(':'.join(mut_chains))
             chain_lens_dicts[pdb] = {chain: len(chain_seq) for chain, chain_seq in mutant_data['sequences'][-1]}
-            wt_seqs[pdb] = wt_info['seq']
+            wt_seqs[pdb] = wt_seq
 
     elif cfg.mutant_csv is not None: # Predict energies for provided mutant sequences from a CSV file
         mutant_df = pd.read_csv(cfg.mutant_csv)
@@ -424,6 +427,7 @@ def process_data(cfg, pdb_list):
                 for chain, mut_type in zip(chain_list.split(':'), mut_type_list.split(':')):
                     mut_type_dict[chain].append(mut_type)
                 mut_seq = []
+                wt_seq = []
                 for chain in wt_info['chain_order']:
                     mut_chain = copy.deepcopy(wt_info[f'seq_chain_{chain}'])
                     if len(mut_type_dict[chain]) > 0: # Use mutant sequence
@@ -435,12 +439,13 @@ def process_data(cfg, pdb_list):
                         mut_seq.append((chain, mut_chain))
                     else: # Use wildtype sequence
                         mut_seq.append((chain, wt_info[f'seq_chain_{chain}']))
+                    wt_seq.append((chain, wt_info[f'seq_chain_{chain}']))
                 mutant_data['pdb'].append(pdb)
                 mutant_data['sequences'].append(mut_seq)
                 mutant_data['ddG_expt'].append(ddG_expt)
                 mutant_data['mut_chains'].append(chain_list)
             chain_lens_dicts[pdb] = {chain: len(chain_seq) for chain, chain_seq in mutant_data['sequences'][-1]}
-            wt_seqs[pdb] = wt_info['seq']
+            wt_seqs[pdb] = wt_seq
 
     else: # Do a DMS screen of all single mutants
         for pdb in pdb_list:
@@ -461,7 +466,7 @@ def process_data(cfg, pdb_list):
                                 mutant_data['ddG_expt'].append(np.nan)
                                 mutant_data['mut_chains'].append(chain)
             chain_lens_dicts[pdb] = {chain: len(chain_seq) for chain, chain_seq in mutant_data['sequences'][-1]}
-            wt_seqs[pdb] = wt_info['seq']
+            wt_seqs[pdb] = wt_chains
 
     if binding_energy_chains: # Split sequences into separate chains if requested for binding prediction
         for pdb, seq in zip(mutant_data['pdb'], mutant_data['sequences']):
@@ -474,14 +479,23 @@ def process_data(cfg, pdb_list):
             for partition in binding_energy_chains[pdb]:
                 partitioned_sequences.append("".join([chain_seq for chain, chain_seq in seq if chain in partition]))
             mutant_data['partitioned_sequences'].append(partitioned_sequences)
+
+        for pdb, wt_seq in wt_seqs.items():
+            partitioned_wt_seqs[pdb] = []
+            for partition in binding_energy_chains[pdb]:
+                partitioned_wt_seqs[pdb].append("".join([chain_seq for chain, chain_seq in wt_seq if chain in partition]))
+            wt_seqs[pdb] = "".join([chain_seq for _, chain_seq in wt_seq])
+
     else:
         mutant_data['partitioned_sequences'] = [None] * len(mutant_data['sequences'])
-
+        for pdb, wt_seq in wt_seqs.items():
+            wt_seqs[pdb] = "".join([chain_seq for _, chain_seq in wt_seq])
+            partitioned_wt_seqs[pdb] = None
     # Save mutant sequences and energies to tensors
     for i_mut in range(len(mutant_data['sequences'])):
         mutant_data['sequences'][i_mut] = "".join([chain_seq for _, chain_seq in mutant_data['sequences'][i_mut]])
     
-    return pd.DataFrame(mutant_data), chain_lens_dicts, wt_seqs, pdb_list, binding_energy_chains
+    return pd.DataFrame(mutant_data), chain_lens_dicts, wt_seqs, partitioned_wt_seqs, pdb_list, binding_energy_chains
 
 def featurize(
     input_dict,
