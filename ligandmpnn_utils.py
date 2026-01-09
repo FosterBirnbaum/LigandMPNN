@@ -9,6 +9,7 @@ import json
 import omegaconf
 from data_utils import parse_PDB, parse_PDB_seq_only, get_nearest_neighbours, alphabet
 from model_utils import nlcpl
+import etab_utils
 
 checkpoints = {
     "protein_mpnn": "./model_params/proteinmpnn_v_48_020.pt",
@@ -357,6 +358,7 @@ def process_data(cfg, pdb_list):
     mutant_data = {'pdb': [], 'sequences': [], 'partitioned_sequences': [], 'ddG_expt': [], 'mut_chains': []}
     chain_lens_dicts = {}
     mut_alphabet = 'ACDEFGHIKLMNPQRSTVWY'
+    wt_seqs = {}
     # Load mutant sequence information
     if cfg.mutant_fasta is not None: # Predict energies for provided mutant sequences from a FASTA file
         with open(cfg.mutant_fasta, 'r') as f:
@@ -407,6 +409,7 @@ def process_data(cfg, pdb_list):
                 mutant_data['ddG_expt'].append(ddG_expt)
                 mutant_data['mut_chains'].append(':'.join(mut_chains))
             chain_lens_dicts[pdb] = {chain: len(chain_seq) for chain, chain_seq in mutant_data['sequences'][-1]}
+            wt_seqs[pdb] = wt_info['seq']
 
     elif cfg.mutant_csv is not None: # Predict energies for provided mutant sequences from a CSV file
         mutant_df = pd.read_csv(cfg.mutant_csv)
@@ -437,6 +440,7 @@ def process_data(cfg, pdb_list):
                 mutant_data['ddG_expt'].append(ddG_expt)
                 mutant_data['mut_chains'].append(chain_list)
             chain_lens_dicts[pdb] = {chain: len(chain_seq) for chain, chain_seq in mutant_data['sequences'][-1]}
+            wt_seqs[pdb] = wt_info['seq']
 
     else: # Do a DMS screen of all single mutants
         for pdb in pdb_list:
@@ -457,6 +461,7 @@ def process_data(cfg, pdb_list):
                                 mutant_data['ddG_expt'].append(np.nan)
                                 mutant_data['mut_chains'].append(chain)
             chain_lens_dicts[pdb] = {chain: len(chain_seq) for chain, chain_seq in mutant_data['sequences'][-1]}
+            wt_seqs[pdb] = wt_info['seq']
 
     if binding_energy_chains: # Split sequences into separate chains if requested for binding prediction
         for pdb, seq in zip(mutant_data['pdb'], mutant_data['sequences']):
@@ -476,7 +481,7 @@ def process_data(cfg, pdb_list):
     for i_mut in range(len(mutant_data['sequences'])):
         mutant_data['sequences'][i_mut] = "".join([chain_seq for _, chain_seq in mutant_data['sequences'][i_mut]])
     
-    return pd.DataFrame(mutant_data), chain_lens_dicts, pdb_list, binding_energy_chains
+    return pd.DataFrame(mutant_data), chain_lens_dicts, wt_seqs, pdb_list, binding_energy_chains
 
 def featurize(
     input_dict,
@@ -657,3 +662,119 @@ def get_log_probs(input_pdb, chain_list, model, cfg):
         log_probs, etab, E_idx = model(feature_dict)
   
     return log_probs, etab, E_idx
+
+
+def score_seqs_potts(etab, E_idx, wt_seq, cfg, nrgs, seqs, partition=None):
+    """
+    Score sequences using the energy table.
+
+    Parameters
+    ----------  
+    etab : torch.Tensor, shape (1, L, 400)
+        Energy table from PottsMPNN model
+    E_idx : torch.Tensor, shape (1, L, k)
+        Edge index table from PottsMPNN model
+    wt_seq : str, shape (L,)
+        Wildtype sequence
+    model : PottsMPNN model
+        Model with which to score sequences
+    cfg : omegaconf
+        Config object
+    pdb_data : dict
+        dict with PDB information
+    nrgs : list of shape (N,)
+        Mutant energy information
+    seqs : list of shape (N, L)
+        Mutant sequence information
+    partition : list (optional, default None)
+        list of chains to analyze
+    
+    Returns
+    -------
+    scores : torch.Tensor, shape (N,)
+        Scores for each sequence.
+    scored_seqs : torch.Tensor, shape (N, L)
+        Scored sequences
+    reference_scores : torch.Tensor, shape (N,)
+        References for scored sequences
+    """
+    
+    # Run energy prediction according to config
+    # Use wildtype as reference energy
+    nrgs = np.insert(nrgs, 0, 0.0)
+    seqs = np.insert(seqs, 0, wt_seq)
+    # Transform nrgs and seqs to tensors
+    nrgs = torch.from_numpy(np.array(nrgs)).to(dtype=torch.float32, device=cfg.dev).unsqueeze(0)
+    seqs = torch.stack([etab_utils.seq_to_tensor(seq) for seq in seqs]).to(dtype=torch.int64, device=cfg.dev).unsqueeze(0)
+
+    if etab.size(1)*nrgs.shape[1] > cfg.inference.max_tokens:
+        batch_size = int(cfg.inference.max_tokens / etab.size(1))
+    else:
+        batch_size = nrgs.shape[1]
+    
+    # Calculate energies
+    scores, scored_seqs, reference_scores = [], [], []
+    for batch in range(0, nrgs.shape[1], batch_size):
+        batch_scores, batch_seqs, batch_refs = etab_utils.calc_eners(etab, E_idx, seqs[:,batch:batch+batch_size], nrgs[:,batch:batch+batch_size], filter=cfg.inference.filter)
+        scores.append(batch_scores)
+        scored_seqs.append(batch_seqs)
+        reference_scores.append(batch_refs)
+    scores, scored_seqs, reference_scores = torch.cat(scores, 1), torch.cat(scored_seqs, 1), torch.cat(reference_scores, 1)
+
+    # Compare to wildtype and remove reference
+    scores = scores -scores[:, 0]
+    scores, scored_seqs, reference_scores = scores[:, 1:], scored_seqs[:, 1:], reference_scores[:, 1:]
+
+    if cfg.inference.mean_norm: # By default, normalize so mean is 0 (helps when comparing proteins with large numbers of mutants)
+        scores -= torch.mean(scores, dim=1)
+    return scores, scored_seqs, reference_scores
+
+def score_seqs_singlesite(logprobs, wt_seq, cfg, nrgs, seqs, partition=None):
+    """
+    Score sequences using the energy table.
+
+    Parameters
+    ----------  
+    logprobs : torch.Tensor, shape (1, L, vocab)
+        Log probabilities
+    wt_seq : str, shape (L,)
+        Wildtype sequence
+    model : PottsMPNN model
+        Model with which to score sequences
+    cfg : omegaconf
+        Config object
+    pdb_data : dict
+        dict with PDB information
+    nrgs : list of shape (N,)
+        Mutant energy information
+    seqs : list of shape (N, L)
+        Mutant sequence information
+    partition : list (optional, default None)
+        list of chains to analyze
+    
+    Returns
+    -------
+    scores : torch.Tensor, shape (N,)
+        Scores for each sequence.
+
+    """
+    
+    # Run energy prediction according to config
+    # Use wildtype as reference energy
+    wt_tensor = etab_utils.seq_to_tensor(wt_seq).to(dtype=torch.int64, device=cfg.dev).unsqueeze(0).unsqueeze(-1)  # Shape (1, 1, L)
+    wt_logprob_vals = logprobs.gather(2, wt_tensor).squeeze(0).squeeze(-1)  # Shape (L,)
+    wt_ener = torch.sum(wt_logprob_vals)
+    scores = []
+    for mut_seq, mut_ener in zip(seqs, nrgs):
+        try:
+            seq_tensor = etab_utils.seq_to_tensor(mut_seq).to(dtype=torch.int64, device=cfg.dev).unsqueeze(0).unsqueeze(-1)  # Shape (1, 1, L)
+            logprob_vals = logprobs.gather(2, seq_tensor).squeeze(0).squeeze(-1)  # Shape (L,)
+            mut_ener = torch.sum(logprob_vals)
+            mut_ener = mut_ener - wt_ener
+            scores.append(mut_ener)
+        except Exception as e:
+            print(f"Error processing mutant sequence {mut_seq} with energy {mut_ener}: {e}")
+            continue
+    scores = torch.stack(scores)  # Shape (N,)
+
+    return scores

@@ -422,6 +422,53 @@ def stability_loss_diff_loop(base_etab, E_idx, data, etab_nolig, E_idx_nolig, ma
         return 0, -1
     return -pearson, data['sortcery_nrgs'].shape[1] # scalar; negate, since we want to minimize our loss function
 
+def calc_eners(etab, E_idx, seqs, nrgs, filter=True):
+    """
+    Calculate Potts energies for a batch of sequences using a dense energy table.
+
+    Args
+    ----
+    etab : torch.Tensor
+        Energy table of shape [B, L, k, h, h]
+    E_idx : torch.LongTensor
+        Neighbor indices of shape [B, L, k]
+    seqs : torch.LongTensor
+        Encoded sequences of shape [B, n, L]
+    nrgs : torch.Tensor or None
+        Reference energies of shape [B, n]
+    filter : bool, optional 
+        Whether to filter out sequences with NaN reference energies, by default True
+    
+    Returns
+    -------
+    batch_scores : torch.Tensor
+        Calculated energies of shape [B, filt_n]
+    seqs : torch.LongTensor
+        Filtered sequences of shape [filt_n , L]
+    nrgs : torch.Tensor
+        Filtered reference energies of shape [filt_n]
+    """
+    b, n, l = seqs.shape
+    h = etab.shape[-1]
+    k = E_idx.shape[-1]
+    etab = etab.unsqueeze(1).expand(b, n, l, k, h, h)
+    E_idx = E_idx.unsqueeze(1).expand(b, n, l, k)
+    E_aa_jn = torch.gather(seqs.unsqueeze(-1).expand(-1, -1, -1, k), 2, E_idx)
+    E_aa_jn = E_aa_jn.view([b, n, l, k, 1, 1]).expand(-1, -1, -1, -1, h, -1)
+    E_aa_im = seqs.unsqueeze(-1).expand(-1, -1, -1, k).unsqueeze(-1)
+    nrgs_jn = torch.gather(etab, 5, E_aa_jn).squeeze(-1) # b x n x L x k x h
+    energies = torch.gather(nrgs_jn, 4, E_aa_im).squeeze(-1) # b x n x L x k
+    batch_scores = energies.sum(dim=(2, 3))
+
+    if filter and nrgs is not None:
+        mask = nrgs != torch.nan
+        seqs = seqs[mask]
+        nrgs = nrgs[mask]
+        batch_pred_E = batch_scores[mask]
+        return batch_pred_E, seqs, nrgs
+    else:
+        return batch_scores, seqs, nrgs
+
 # zero is used as padding
 AA_to_int = {
     'A': 1,
@@ -510,3 +557,9 @@ def esm_ints_to_seq_torch(seq):
 
 def ints_to_seq_normal(seq):
     return "".join(ints_to_seq(seq))
+
+def seq_to_tensor(sequence, dev='cpu'):
+    """
+    Given a string of one-letter encoded AAs, return its corresponding integer encoding as a PyTorch tensor
+    """
+    return torch.tensor(seq_to_ints(sequence), dtype=torch.int64).to(device=dev)
