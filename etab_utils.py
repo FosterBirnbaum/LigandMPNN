@@ -7,8 +7,7 @@ import math
 import numpy as np
 from torch.nn.utils.rnn import pad_sequence
 import re
-
-def merge_duplicate_pairE(h_E, E_idx):
+def merge_duplicate_pairE(h_E, E_idx, denom=2):
     """ Average pair energy tables across bidirectional edges.
 
     TERMinator edges are represented as two bidirectional edges, and to allow for
@@ -35,74 +34,24 @@ def merge_duplicate_pairE(h_E, E_idx):
     try:
         k = E_idx.shape[-1]
         seq_lens = torch.ones(h_E.shape[0]).long().to(h_E.device) * h_E.shape[1]
-        if len(h_E.shape) > 4:
-            h_E_geometric = h_E.view([-1, 400])
-            orig_length = 5
-        else:
-            h_E_geometric = h_E.view([-1, h_E.shape[-1]])
-            orig_length = 4
+        h_E_geometric = h_E.view([-1, 400])
         split_E_idxs = torch.unbind(E_idx)
         offset = [seq_lens[:i].sum() for i in range(len(seq_lens))]
         split_E_idxs = [e.to(h_E.device) + o for e, o in zip(split_E_idxs, offset)]
         edge_index_row = torch.cat([e.view(-1) for e in split_E_idxs], dim=0)
         edge_index_col = torch.repeat_interleave(torch.arange(edge_index_row.shape[0] // k), k).to(h_E.device)
         edge_index = torch.stack([edge_index_row, edge_index_col])
-        merge = merge_duplicate_pairE_geometric(h_E_geometric, edge_index, orig_length)
+        merge = merge_duplicate_pairE_geometric(h_E_geometric, edge_index, denom=denom)
         merge = merge.view(h_E.shape)
-        #old_merge = merge_duplicate_pairE_dense(h_E, E_idx)
-        #assert (old_merge == merge).all(), (old_merge, merge)
 
         return merge
     except RuntimeError as err:
         print(err, file=sys.stderr)
         print("We're handling this error as if it's an out-of-memory error", file=sys.stderr)
         torch.cuda.empty_cache()  # this is probably unnecessary but just in case
-        raise err
         return merge_duplicate_pairE_sparse(h_E, E_idx)
 
 
-def merge_duplicate_pairE_dense(h_E, E_idx):
-    """ Dense method to average pair energy tables across bidirectional edges.
-
-    TERMinator edges are represented as two bidirectional edges, and to allow for
-    communication between these edges we average the embeddings. In the case for
-    pair energies, we transpose the tables to ensure that the pair energy table
-    is symmetric upon inverse (e.g. the pair energy between i and j should be
-    the same as the pair energy between j and i)
-
-    Args
-    ----
-    h_E : torch.Tensor
-        Pair energies in kNN sparse form
-        Shape : n_batch x n_res x k x n_aa x n_aa
-    E_idx : torch.LongTensor
-        kNN sparse edge indices
-        Shape : n_batch x n_res x k
-
-    Returns
-    -------
-    torch.Tensor
-        Pair energies with merged energies for bidirectional edges
-        Shape : n_batch x n_res x k x n_aa x n_aa
-    """
-    dev = h_E.device
-    n_batch, n_nodes, _, n_aa, _ = h_E.shape
-    # collect edges into NxN tensor shape
-    collection = torch.zeros((n_batch, n_nodes, n_nodes, n_aa, n_aa)).to(dev)
-    neighbor_idx = E_idx.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, -1, n_aa, n_aa).to(dev)
-    collection.scatter_(2, neighbor_idx, h_E)
-    # transpose to get same edge in reverse direction
-    collection = collection.transpose(1, 2)
-    # transpose each pair energy table as well
-    collection = collection.transpose(-2, -1)
-    # gather reverse edges
-    reverse_E = gather_pairEs(collection, E_idx)
-    # average h_E and reverse_E at non-zero positions
-    merged_E = torch.where(reverse_E != 0, (h_E + reverse_E) / 2, h_E)
-    return merged_E
-
-
-# TODO: rigorous test that this is equiv to the dense version
 def merge_duplicate_pairE_sparse(h_E, E_idx):
     """ Sparse method to average pair energy tables across bidirectional edges.
 
@@ -177,7 +126,7 @@ def merge_duplicate_pairE_sparse(h_E, E_idx):
     return merged_etab
 
 
-def merge_duplicate_pairE_geometric(h_E, edge_index, orig_length=4):
+def merge_duplicate_pairE_geometric(h_E, edge_index, denom=2):
     """ Sparse method to average pair energy tables across bidirectional edges with Torch Geometric.
 
     TERMinator edges are represented as two bidirectional edges, and to allow for
@@ -214,15 +163,15 @@ def merge_duplicate_pairE_geometric(h_E, edge_index, orig_length=4):
 
     reverse_idx = mapping[row_idx]
     mask = (reverse_idx >= 0)
+    if denom != 2:
+        mask[(reverse_idx % 48 == 0)] = False
     reverse_idx = reverse_idx[mask]
 
     reverse_h_E = h_E[mask]
-    transpose_h_E = reverse_h_E.view([-1, 20, 20]).transpose(-1, -2).reshape([-1, h_E.shape[-1]])
-    
-    h_E[reverse_idx] = (h_E[reverse_idx] + transpose_h_E)/2
+    transpose_h_E = reverse_h_E.view([-1, 20, 20]).transpose(-1, -2).reshape([-1, 400])
+    h_E[reverse_idx] = (h_E[reverse_idx] + transpose_h_E)/denom
 
     return h_E
-
 
 def expand_etab(etab, idxs):
     h = etab.shape[-1]
