@@ -7,6 +7,11 @@ import copy
 from collections import defaultdict
 import json
 import omegaconf
+import seaborn as sns
+import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
+from matplotlib.patches import Rectangle
+from matplotlib.collections import LineCollection
 from data_utils import parse_PDB, parse_PDB_seq_only, get_nearest_neighbours, alphabet
 from model_utils import nlcpl
 import etab_utils
@@ -792,3 +797,240 @@ def score_seqs_singlesite(logprobs, wt_seq, cfg, nrgs, seqs, partition=None):
     scores = torch.stack(scores)  # Shape (N,)
 
     return scores
+
+
+def plot_data(data,
+              only_mutated_positions=False,
+              title='PottsMPNN Predictions',
+              clabel=r'Predicted $\Delta\Delta$G (a.u.)',
+              save_path=None,
+              figsize=(20, 5),
+              ener_type='ddG',
+              chain_ranges=None,
+              chain_order=None):
+    """
+    Plots a heatmap of mutation energies from a dataframe.
+
+    Parameters:
+    - data : DataFrame with columns 'mutant', 'wildtype', 'ddG_pred'.
+            Sequences use ':' as chain delimiters.
+    - only_mutated_positions : If True, only plots columns (residues) that have at least one mutation.
+    - chain_ranges : Dict { 'A': [start, stop] } defining inclusive 1-indexed ranges for specific chains.
+    - chain_order : List of strings (e.g. ['H', 'L']). 
+                   1. Maps the split input sequences to these names (Index 0 -> chain_order[0]).
+                   2. Determines the order in which chains are plotted.
+                   If None, defaults to ['A', 'B', 'C'...] and alphabetical sort.
+    """
+
+    amino_acids = ['A', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'K', 'L',
+                   'M', 'N', 'P', 'Q', 'R', 'S', 'T', 'V', 'W', 'Y']
+    aa_to_idx = {aa: i for i, aa in enumerate(amino_acids)}
+
+    # --- 1. Parse Data ---
+    parsed_data = {}     # parsed_data[chain_name][pos] = {wt, muts}
+    chain_sequences = {} # chain_sequences[chain_name] = list(sequence)
+
+    for _, row in data.iterrows():
+        wt_seq = row['wildtype']
+        mut_seq = row['mutant']
+        energy = row['ddG_pred']
+
+        wt_chains = wt_seq.split(':')
+        mut_chains = mut_seq.split(':')
+
+        if len(wt_chains) != len(mut_chains):
+            continue 
+
+        # Determine Chain Names for this row
+        current_chain_names = []
+        if chain_order:
+            current_chain_names = chain_order[:len(wt_chains)]
+        else:
+            current_chain_names = [chr(65 + i) for i in range(len(wt_chains))]
+
+        # Identify mutations
+        global_mutations = [] 
+        
+        for c_name, w_chain, m_chain in zip(current_chain_names, wt_chains, mut_chains):
+            if len(w_chain) != len(m_chain): continue 
+            
+            # Store WT sequence logic (first time we see this chain name)
+            if c_name not in chain_sequences:
+                chain_sequences[c_name] = list(w_chain)
+            
+            # Find mismatches
+            for i, (w, m) in enumerate(zip(w_chain, m_chain)):
+                if w != m:
+                    # 1-indexed position
+                    global_mutations.append((c_name, i + 1, w, m))
+
+        # Constraint: Only single mutations allowed per row
+        if len(global_mutations) == 1:
+            c_name, pos, wt, mut = global_mutations[0]
+            
+            if c_name not in parsed_data: parsed_data[c_name] = {}
+            if pos not in parsed_data[c_name]: parsed_data[c_name][pos] = {'wt': wt, 'muts': {}}
+            
+            parsed_data[c_name][pos]['muts'][mut] = energy
+
+    # --- 2. Determine Chains to Plot ---
+    if chain_order:
+        active_chain_names = [c for c in chain_order if c in chain_sequences]
+    else:
+        active_chain_names = sorted(chain_sequences.keys())
+
+    if not active_chain_names:
+        print("No valid data found to plot.")
+        return
+
+    # --- 3. Construct Matrix Columns ---
+    matrix_columns = []   # List of (chain_name, pos, wt_residue)
+    chain_boundaries = [] # List of column indices where new chains start
+
+    current_col_idx = 0
+    for c_name in active_chain_names:
+        chain_boundaries.append(current_col_idx)
+        full_seq = chain_sequences[c_name]
+        
+        # Determine valid range for this chain
+        start_r, stop_r = 1, len(full_seq)
+        if chain_ranges and c_name in chain_ranges:
+            start_r, stop_r = chain_ranges[c_name]
+            if start_r == 0:
+                start_r = 1
+            if stop_r == -1:
+                stop_r = len(full_seq)
+        elif chain_ranges:
+            continue 
+
+        # Determine which positions to include
+        if only_mutated_positions:
+            existing_pos = sorted(parsed_data.get(c_name, {}).keys())
+            positions = [p for p in existing_pos if start_r <= p <= stop_r]
+        else:
+            actual_start = max(1, start_r)
+            actual_stop = min(len(full_seq), stop_r)
+            if actual_start > actual_stop:
+                positions = []
+            else:
+                positions = range(actual_start, actual_stop + 1)
+
+        for pos in positions:
+            wt_aa = full_seq[pos - 1] # 0-indexed lookup
+            matrix_columns.append((c_name, pos, wt_aa))
+            current_col_idx += 1
+            
+    # Initialize matrix
+    heatmap_data = np.full((len(amino_acids), len(matrix_columns)), np.nan)
+
+    # Fill matrix
+    for col_idx, (c_name, pos, wt_aa) in enumerate(matrix_columns):
+        if ener_type == 'ddG' and wt_aa in aa_to_idx:
+            heatmap_data[aa_to_idx[wt_aa], col_idx] = 0.0
+
+        if c_name in parsed_data and pos in parsed_data[c_name]:
+            muts = parsed_data[c_name][pos]['muts']
+            for mut_aa, ener in muts.items():
+                if mut_aa in aa_to_idx:
+                    row_idx = aa_to_idx[mut_aa]
+                    heatmap_data[row_idx, col_idx] = ener
+
+    # --- 4. Plotting ---
+    blue = (0.0, 0.0, 1.0)
+    gray90 = (0.9, 0.9, 0.9)
+    red = (1.0, 0.0, 0.0)
+    cmap = mcolors.LinearSegmentedColormap.from_list("Blue_Gray90_Red", [blue, gray90, red])
+    
+    if ener_type == 'ddG':
+        center = 0
+    else:
+        center = np.nanmean(heatmap_data)
+
+    fig, ax = plt.subplots(figsize=figsize, dpi=150)
+    sns.set(font_scale=0.8)
+    ax.set_facecolor('#E0E0E0')
+
+    # Prepare labels
+    tick_labels = [f"{wt}{pos}" for (_, pos, wt) in matrix_columns]
+
+    sns.heatmap(
+        heatmap_data,
+        cmap=cmap,
+        center=center,
+        yticklabels=amino_acids,
+        xticklabels=False, 
+        cbar_kws={'shrink': 0.8, 'pad': 0.02, 'label': clabel},
+        mask=np.isnan(heatmap_data),
+        ax=ax
+    )
+    ax.collections[0].colorbar.ax.set_ylabel(clabel, fontsize=12) 
+    ax.collections[0].colorbar.ax.tick_params(labelsize=12)
+
+    # --- 5. Styling Missing Data (Exact 'X' using Lines) ---
+    segments = []
+    rows, cols = heatmap_data.shape
+    for r in range(rows):
+        for c in range(cols):
+            if np.isnan(heatmap_data[r, c]):
+                p1 = (c, r)
+                p2 = (c + 1, r + 1)
+                p3 = (c, r + 1)
+                p4 = (c + 1, r)
+                segments.append([p1, p2])
+                segments.append([p3, p4])
+    
+    if segments:
+        lc = LineCollection(segments, color='gray', linewidths=0.5, alpha=0.5)
+        ax.add_collection(lc)
+
+    # --- 6. Formatting Axes & Borders ---
+    for tick in ax.get_yticklabels():
+        tick.set_rotation(0)
+        tick.set_ha('left')
+        tick.set_position((-0.02, tick.get_position()[1]))
+        tick.set_fontsize(12)
+
+    # Font size calculation
+    n_cols = len(matrix_columns)
+    tick_indices = np.arange(0, n_cols, 1)
+    tick_locs = tick_indices + 0.5
+    fig_w, _ = fig.get_size_inches()
+    ax_w_frac = ax.get_position().width
+    box_w_inches = (fig_w * ax_w_frac) / max(1, n_cols)
+    max_font_size = box_w_inches * 72 * 0.9
+    final_fontsize = min(12, max_font_size)
+
+    ax.set_xticks(tick_locs)
+    ax.set_xticklabels(tick_labels, rotation=90, fontsize=final_fontsize)
+
+    plt.xlabel('Wildtype Residue', fontsize=12, labelpad=25) 
+    plt.ylabel('Mutant Residue', fontsize=12)
+    plt.title(title, fontsize=12)
+
+    # Add Borders around Chains & Chain Labels
+    boundaries = chain_boundaries + [len(matrix_columns)]
+    
+    for i, c_name in enumerate(active_chain_names):
+        if chain_ranges and c_name not in chain_ranges:
+            continue
+        start = boundaries[i]
+        end = boundaries[i+1]
+        width = end - start
+        height = len(amino_acids)
+        
+        # 1. Draw Border
+        rect = Rectangle((start, 0), width, height, 
+                         fill=False, edgecolor='black', lw=2, clip_on=False)
+        ax.add_patch(rect)
+
+        # 2. Add Chain Label
+        # Calculate center in data coordinates (x-axis)
+        center_x = (start + end) / 2
+        
+        ax.text(center_x, -0.14, f"Chain {c_name}", 
+                ha='center', va='top', fontsize=12, fontweight='bold',
+                transform=ax.get_xaxis_transform())
+
+    if save_path is not None:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.show()
