@@ -480,3 +480,183 @@ def process_data(cfg):
         mutant_data['sequences'][i_mut] = "".join([chain_seq for _, chain_seq in mutant_data['sequences'][i_mut]])
     
     return pd.DataFrame(mutant_data), chain_lens_dicts, pdb_list, binding_energy_chains
+
+def featurize(
+    input_dict,
+    cutoff_for_score=8.0,
+    use_atom_context=True,
+    number_of_ligand_atoms=16,
+    model_type="protein_mpnn"):
+    output_dict = {}
+    if model_type == "ligand_mpnn":
+        mask = input_dict["mask"]
+        Y = input_dict["Y"]
+        Y_t = input_dict["Y_t"]
+        Y_m = input_dict["Y_m"]
+        N = input_dict["X"][:, 0, :]
+        CA = input_dict["X"][:, 1, :]
+        C = input_dict["X"][:, 2, :]
+        b = CA - N
+        c = C - CA
+        a = torch.cross(b, c, axis=-1)
+        CB = -0.58273431 * a + 0.56802827 * b - 0.54067466 * c + CA
+        Y, Y_t, Y_m, D_XY = get_nearest_neighbours(
+            CB, mask, Y, Y_t, Y_m, number_of_ligand_atoms
+        )
+        mask_XY = (D_XY < cutoff_for_score) * mask * Y_m[:, 0]
+        output_dict["mask_XY"] = mask_XY[None,]
+        if "side_chain_mask" in list(input_dict):
+            output_dict["side_chain_mask"] = input_dict["side_chain_mask"][None,]
+        output_dict["Y"] = Y[None,]
+        output_dict["Y_t"] = Y_t[None,]
+        output_dict["Y_m"] = Y_m[None,]
+        if not use_atom_context:
+            output_dict["Y_m"] = 0.0 * output_dict["Y_m"]
+    elif (
+        model_type == "per_residue_label_membrane_mpnn"
+        or model_type == "global_label_membrane_mpnn"
+    ):
+        output_dict["membrane_per_residue_labels"] = input_dict[
+            "membrane_per_residue_labels"
+        ][None,]
+
+    R_idx_list = []
+    count = 0
+    R_idx_prev = -100000
+    for R_idx in list(input_dict["R_idx"]):
+        if R_idx_prev == R_idx:
+            count += 1
+        R_idx_list.append(R_idx + count)
+        R_idx_prev = R_idx
+    R_idx_renumbered = torch.tensor(R_idx_list, device=R_idx.device)
+    output_dict["R_idx"] = R_idx_renumbered[None,]
+    output_dict["R_idx_original"] = input_dict["R_idx"][None,]
+    output_dict["chain_labels"] = input_dict["chain_labels"][None,]
+    output_dict["S"] = input_dict["S"][None,]
+    output_dict["chain_mask"] = input_dict["chain_mask"][None,]
+    output_dict["mask"] = input_dict["mask"][None,]
+
+    output_dict["X"] = input_dict["X"][None,]
+
+    if "xyz_37" in list(input_dict):
+        output_dict["xyz_37"] = input_dict["xyz_37"][None,]
+        output_dict["xyz_37_m"] = input_dict["xyz_37_m"][None,]
+
+    return output_dict
+
+def get_log_probs(input_pdb, chain_list, model, cfg):
+  
+    device = cfg.dev
+    
+    # make protein dict
+    protein_dict, backbone, other_atoms, icodes, _ = parse_PDB(
+                input_pdb,
+                device=device,
+                chains=chain_list,
+                parse_all_atoms=cfg.inference.ligand_mpnn_use_side_chain_context,
+                parse_atoms_with_zero_occupancy=cfg.inference.parse_atoms_with_zero_occupancy,
+                updated_alist=cfg.inference.updated_alist,
+            )
+    if cfg.inference.nolig:
+        protein_dict["Y"] = torch.zeros((1, 3), dtype=torch.float32).to(protein_dict["Y"].device)
+        protein_dict["Y_t"] = torch.zeros((1), dtype=torch.float32).to(protein_dict["Y_t"].device)
+        protein_dict["Y_m"] = torch.zeros((1), dtype=torch.float32).to(protein_dict["Y_m"].device)
+
+    # make chain_letter + residue_idx + insertion_code mapping to integers
+    R_idx_list = list(protein_dict["R_idx"].cpu().numpy())  # residue indices
+    chain_letters_list = list(protein_dict["chain_letters"])  # chain letters
+    encoded_residues = []
+    for i, R_idx_item in enumerate(R_idx_list):
+        tmp = str(chain_letters_list[i]) + str(R_idx_item) + icodes[i]
+        encoded_residues.append(tmp)
+    encoded_residue_dict = dict(zip(encoded_residues, range(len(encoded_residues))))
+    encoded_residue_dict_rev = dict(
+        zip(list(range(len(encoded_residues))), encoded_residues)
+    )
+
+    bias_AA_per_residue = torch.zeros(
+        [len(encoded_residues), cfg.model.vocab], device=device, dtype=torch.float32
+    )
+
+    fixed_positions = torch.tensor(
+        [int(True) for item in encoded_residues],
+        device=device,
+    )
+    redesigned_positions = torch.tensor(
+        [int(False) for item in encoded_residues],
+        device=device,
+    )
+
+    # specify which residues are buried for checkpoint_per_residue_label_membrane_mpnn model
+    if cfg.inference.transmembrane_buried:
+        buried_residues = [item for item in cfg.inference.transmembrane_buried.split()]
+        buried_positions = torch.tensor(
+            [int(item in buried_residues) for item in encoded_residues],
+            device=device,
+        )
+    else:
+        buried_positions = torch.zeros_like(fixed_positions)
+
+    if cfg.inference.transmembrane_interface:
+        interface_residues = [item for item in cfg.inference.transmembrane_interface.split()]
+        interface_positions = torch.tensor(
+            [int(item in interface_residues) for item in encoded_residues],
+            device=device,
+        )
+    else:
+        interface_positions = torch.zeros_like(fixed_positions)
+    protein_dict["membrane_per_residue_labels"] = 2 * buried_positions * (
+        1 - interface_positions
+    ) + 1 * interface_positions * (1 - buried_positions)
+
+    # create chain_mask
+    chains_to_design_list = protein_dict["chain_letters"]
+    chain_mask = torch.tensor(
+        np.array(
+            [
+                item in chains_to_design_list
+                for item in protein_dict["chain_letters"]
+            ],
+            dtype=np.int32,
+        ),
+        device=device,
+    )
+    protein_dict["chain_mask"] = chain_mask
+
+    # featurize
+    feature_dict = featurize(
+        protein_dict,
+        cutoff_for_score=cfg.inference.ligand_mpnn_cutoff_for_score,
+        use_atom_context=cfg.inference.ligand_mpnn_use_atom_context,
+        number_of_ligand_atoms=cfg.inference.atom_context_num,
+        model_type=cfg.model.model_type,
+    )
+    feature_dict["batch_size"] = 1
+    B, L, _, _ = feature_dict["X"].shape  # batch size should be 1 for now.
+    omit_AA = torch.tensor(
+        np.array([False for AA in alphabet]).astype(np.float32),
+        device=device,
+    )
+    omit_AA_per_residue = torch.zeros(
+        [len(encoded_residues), cfg.model.vocab], device=device, dtype=torch.float32
+    )
+    bias_AA = torch.zeros([cfg.model.vocab], device=device, dtype=torch.float32)
+    bias_AA_per_residue = torch.zeros(
+        [len(encoded_residues), cfg.model.vocab], device=device, dtype=torch.float32
+    )
+    feature_dict["bias"] = (
+                    (-1e8 * omit_AA[None, None, :] + bias_AA).repeat([1, L, 1])
+                    + bias_AA_per_residue[None]
+                    - 1e8 * omit_AA_per_residue[None]
+                )
+    feature_dict["symmetry_residues"] = [[]]
+    feature_dict["symmetry_weights"] = [[]]
+    feature_dict["randn"] = torch.randn(
+        [feature_dict["batch_size"], feature_dict["mask"].shape[1]],
+        device=device,
+    )
+
+    with torch.no_grad():
+        log_probs, etab, E_idx = model(feature_dict)
+  
+    return log_probs, etab, E_idx
