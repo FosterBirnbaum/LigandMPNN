@@ -565,7 +565,7 @@ def featurize(
 
     return output_dict
 
-def get_log_probs(input_pdb, chain_list, model, cfg):
+def get_log_probs_colab(input_pdb, chain_list, model, cfg):
   
     device = cfg.dev
     
