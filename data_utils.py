@@ -1037,6 +1037,18 @@ def parse_PDB_seq_only(path_to_pdb, parse_atoms_with_zero_occupancy=False, input
         'seq': ''.join(S)
     }
 
+    for chain in chain_order:
+        start_i = -1
+        for i in range(len(CA_resnums)):
+            if CA_chain_ids[i] == chain:
+                if start_i == -1:
+                    start_i = i
+            if CA_chain_ids[i] != chain and start_i != -1:
+                my_dict[f'seq_chain_{chain}'] = ''.join(S[start_i:i])
+                break
+
+    print(my_dict)
+
     return my_dict
 
 def get_nearest_neighbours(CB, mask, Y, Y_t, Y_m, number_of_ligand_atoms):
