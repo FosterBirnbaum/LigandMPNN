@@ -1045,8 +1045,10 @@ def parse_PDB_seq_only(path_to_pdb, parse_atoms_with_zero_occupancy=False, input
                     start_i = i
             if CA_chain_ids[i] != chain and start_i != -1:
                 my_dict[f'seq_chain_{chain}'] = ''.join(S[start_i:i])
+                start_i = -2
                 break
-
+        if start_i == -2:
+            my_dict[f'seq_chain_{chain}'] = ''.join(S[start_i:])
     print(my_dict)
 
     return my_dict
