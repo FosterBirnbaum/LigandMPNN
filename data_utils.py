@@ -1049,7 +1049,6 @@ def parse_PDB_seq_only(path_to_pdb, parse_atoms_with_zero_occupancy=False, input
                 break
         if start_i >= 0:
             my_dict[f'seq_chain_{chain}'] = ''.join(S[start_i:])
-    print(my_dict)
 
     return my_dict
 
