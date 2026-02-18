@@ -805,14 +805,9 @@ def parse_PDB(
         for item in chains:
             str_out += " segment " + item + " or"
         atoms = atoms.select(str_out[1:-3])
-    try:
-        protein_atoms = atoms.select("protein")
-        backbone = protein_atoms.select("backbone")
-    except Exception as e:
-        with open('/orcd/scratch/orcd/001/fosterb/pmpnn_experiments/ligandmpnn_potts_nomixed/log_error.out', 'a') as f:
-            f.write(str(input_path) + '\n')
-            f.write(str(e) + '\n')
-        return None, None, None, None, None
+
+    protein_atoms = atoms.select("protein")
+    backbone = protein_atoms.select("backbone")
     other_atoms = atoms.select("not protein and not water")
     water_atoms = atoms.select("water")
 
@@ -991,28 +986,56 @@ def parse_PDB_biounits_seq_only(x, chain=None, skip_gaps=False):
   except TypeError:
       return 'no_chain'
 
-def parse_PDB_seq_only(path_to_pdb, input_chain_list=None, ca_only=False, skip_gaps=False):
-    init_alphabet = ['A', 'B', 'C', 'D', 'E', 'F', 'G','H', 'I', 'J','K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T','U', 'V','W','X', 'Y', 'Z', 'a', 'b', 'c', 'd', 'e', 'f', 'g','h', 'i', 'j','k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't','u', 'v','w','x', 'y', 'z']
-    extra_alphabet = [str(item) for item in list(np.arange(300))]
-    chain_alphabet = init_alphabet + extra_alphabet
-     
-    if input_chain_list:
-        chain_alphabet = input_chain_list  
+def parse_PDB_seq_only(path_to_pdb, parse_atoms_with_zero_occupancy=False, input_chain_list=None):
+    restype_3to1 = {
+        "ALA": "A",
+        "ARG": "R",
+        "ASN": "N",
+        "ASP": "D",
+        "CYS": "C",
+        "GLN": "Q",
+        "GLU": "E",
+        "GLY": "G",
+        "HIS": "H",
+        "ILE": "I",
+        "LEU": "L",
+        "LYS": "K",
+        "MET": "M",
+        "PHE": "F",
+        "PRO": "P",
+        "SER": "S",
+        "THR": "T",
+        "TRP": "W",
+        "TYR": "Y",
+        "VAL": "V",
+    }
+    atoms = parsePDB(path_to_pdb)
 
-    my_dict = {}
+    if not parse_atoms_with_zero_occupancy:
+        atoms = atoms.select("occupancy > 0")
+    if input_chain_list:
+        str_out = ""
+        for item in input_chain_list:
+            str_out += " chain " + item + " or"
+        atoms = atoms.select(str_out[1:-3])
+        
+    protein_atoms = atoms.select("protein")
+    CA_atoms = protein_atoms.select("name CA")
+    S = CA_atoms.getResnames()
+    S = [restype_3to1[AA] if AA in list(restype_3to1) else "X" for AA in list(S)]
+    CA_resnums = CA_atoms.getResnums()
+    CA_chain_ids = CA_atoms.getChids()
     chain_order = []
-    concat_seq = ''
-    for letter in chain_alphabet:
-        seq = parse_PDB_biounits_seq_only(path_to_pdb, chain=letter, skip_gaps=skip_gaps)
-        if type(seq) != str:
-            concat_seq += seq[0]
-            my_dict['seq_chain_'+letter]=seq[0]
-            chain_order.append(letter)
-    fi = path_to_pdb.rfind("/")
-    my_dict['name']=path_to_pdb[(fi+1):-4]
-    my_dict['num_of_chains'] = len(chain_order)
-    my_dict['seq'] = concat_seq
-    my_dict['chain_order'] = chain_order
+    for i in range(len(CA_resnums)):
+        if CA_chain_ids[i] not in chain_order:
+            chain_order.append(CA_chain_ids[i])
+
+    my_dict = {
+        'name': path_to_pdb[(path_to_pdb.rfind('/')+1):-4],
+        'num_of_chains': len(chain_order),
+        'chain_order': chain_order,
+        'seq': ''.join(S)
+    }
 
     return my_dict
 

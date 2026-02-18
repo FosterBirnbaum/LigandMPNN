@@ -375,7 +375,7 @@ def process_data(cfg, pdb_list):
 
         for pdb in pdb_list:
             # Gather information about wild-type sequence
-            wt_info = parse_PDB_seq_only(os.path.join(cfg.input_dir, pdb + '.pdb'), skip_gaps=cfg.inference.skip_gaps)
+            wt_info = parse_PDB_seq_only(os.path.join(cfg.input_dir, pdb + '.pdb'), parse_atoms_with_zero_occupancy=cfg.inference.parse_atoms_with_zero_occupancy)
             for header, seq in mutant_seqs[pdb]:
                 header = header.strip('>')
                 # Parse mutant sequence header
@@ -426,7 +426,7 @@ def process_data(cfg, pdb_list):
             mutant_df['ddG_expt'] = [np.nan] * len(mutant_df)
         for pdb in mutant_df['pdb'].unique():
             pdb_df = mutant_df[mutant_df['pdb'] == pdb]
-            wt_info = parse_PDB_seq_only(os.path.join(cfg.input_dir, pdb + '.pdb'), skip_gaps=cfg.inference.skip_gaps)
+            wt_info = parse_PDB_seq_only(os.path.join(cfg.input_dir, pdb + '.pdb'), parse_atoms_with_zero_occupancy=cfg.inference.parse_atoms_with_zero_occupancy)
             for chain_list, mut_type_list, ddG_expt in zip(pdb_df['chain'], pdb_df['mut_type'], pdb_df['ddG_expt']):
                 mut_type_dict = defaultdict(list)
                 for chain, mut_type in zip(chain_list.split(':'), mut_type_list.split(':')):
@@ -454,7 +454,7 @@ def process_data(cfg, pdb_list):
 
     else: # Do a DMS screen of all single mutants
         for pdb in pdb_list:
-            wt_info = parse_PDB_seq_only(os.path.join(cfg.input_dir, pdb + '.pdb'), skip_gaps=cfg.inference.skip_gaps)
+            wt_info = parse_PDB_seq_only(os.path.join(cfg.input_dir, pdb + '.pdb'), parse_atoms_with_zero_occupancy=cfg.inference.parse_atoms_with_zero_occupancy)
             wt_chains = [(chain, wt_info[f'seq_chain_{chain}']) for chain in wt_info['chain_order']]
             for i_chain, chain in enumerate(wt_info['chain_order']):
                 mut_seq = ""
