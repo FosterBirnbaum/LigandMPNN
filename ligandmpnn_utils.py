@@ -642,6 +642,8 @@ def get_log_probs_colab(input_pdb, chain_list, model, cfg):
         ),
         device=device,
     )
+    if cfg.inference.ligand_mpnn_use_side_chain_context: # Optionally enable side chains for colab, where all sequence is known
+        chain_mask = torch.zeros_like(chain_mask)
     protein_dict["chain_mask"] = chain_mask
 
     # featurize
