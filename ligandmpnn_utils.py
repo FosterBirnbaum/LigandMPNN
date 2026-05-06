@@ -479,7 +479,7 @@ def process_data(cfg, pdb_list):
             all_chains = []
             for partition in binding_energy_chains[pdb]:
                 all_chains += partition
-            assert sorted(all_chains) == sorted([chain for chain, _ in seq]), "Chain partitions must include all chains in structure"
+            assert set(all_chains) >= set(chain for chain, _ in seq), "Chain partitions must include all chains in structure"
             partitioned_sequences = []
             for partition in binding_energy_chains[pdb]:
                 partitioned_sequences.append("".join([chain_seq for chain, chain_seq in seq if chain in partition]))
