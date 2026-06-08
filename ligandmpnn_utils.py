@@ -938,18 +938,36 @@ def plot_data(data,
                     heatmap_data[row_idx, col_idx] = ener
 
     # --- 4. Plotting ---
-    blue = (0.0, 0.0, 1.0)
+    # Asymmetric colorbar: red @ min, gray90 @ 0, blue @ max (NOT symmetric around 0).
+    red    = (1.0, 0.0, 0.0)
     gray90 = (0.9, 0.9, 0.9)
-    red = (1.0, 0.0, 0.0)
-    cmap = mcolors.LinearSegmentedColormap.from_list("Blue_Gray90_Red", [blue, gray90, red])
-    
-    if ener_type == 'ddG':
-        center = 0
+    blue   = (0.0, 0.0, 1.0)
+    cmap = mcolors.LinearSegmentedColormap.from_list(
+        "Red_Gray90_Blue", [blue, gray90, red]
+    )
+
+    # Data range (ignoring NaNs)
+    finite_vals = heatmap_data[np.isfinite(heatmap_data)]
+    if finite_vals.size > 0:
+        c_min = float(np.min(finite_vals))
+        c_max = float(np.max(finite_vals))
     else:
-        center = np.nanmean(heatmap_data)
+        c_min, c_max = -1.0, 1.0
+
+    if ener_type == 'ddG' and c_min < 0.0 < c_max:
+        # Two-slope norm: gray pinned to 0, red to c_min, blue to c_max.
+        # Each side is scaled independently — no symmetric stretching.
+        norm = mcolors.TwoSlopeNorm(vmin=c_min, vcenter=0.0, vmax=c_max)
+        heatmap_kwargs = dict(norm=norm)
+    elif ener_type == 'ddG':
+        # All values are on one side of zero; plain linear scaling.
+        heatmap_kwargs = dict(vmin=c_min, vmax=c_max)
+    else:
+        # Non-ddG: keep the old behavior of centering on the data mean.
+        heatmap_kwargs = dict(center=float(np.nanmean(heatmap_data)))
 
     fig, ax = plt.subplots(figsize=figsize, dpi=150)
-    sns.set(font_scale=0.8)
+    sns.set_theme(font_scale=0.8)
     ax.set_facecolor('#E0E0E0')
 
     # Prepare labels
@@ -958,16 +976,16 @@ def plot_data(data,
     sns.heatmap(
         heatmap_data,
         cmap=cmap,
-        center=center,
         yticklabels=amino_acids,
-        xticklabels=False, 
+        xticklabels=False,
         cbar_kws={'shrink': 0.8, 'pad': 0.02, 'label': clabel},
         mask=np.isnan(heatmap_data),
-        ax=ax
+        ax=ax,
+        **heatmap_kwargs,
     )
-    ax.collections[0].colorbar.ax.set_ylabel(clabel, fontsize=12) 
+    ax.collections[0].colorbar.ax.set_ylabel(clabel, fontsize=12)
     ax.collections[0].colorbar.ax.tick_params(labelsize=12)
-
+    
     # --- 5. Styling Missing Data (Exact 'X' using Lines) ---
     segments = []
     rows, cols = heatmap_data.shape
