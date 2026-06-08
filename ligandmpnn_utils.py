@@ -943,7 +943,7 @@ def plot_data(data,
     gray90 = (0.9, 0.9, 0.9)
     blue   = (0.0, 0.0, 1.0)
     cmap = mcolors.LinearSegmentedColormap.from_list(
-        "Red_Gray90_Blue", [blue, gray90, red]
+        "Blue_Gray90_Red", [blue, gray90, red]
     )
 
     # Data range (ignoring NaNs)
