@@ -800,6 +800,129 @@ def score_seqs_singlesite(logprobs, wt_seq, cfg, nrgs, seqs, partition=None):
 
     return scores
 
+def _compute_mut_type(wt_seq_chained, mut_seq_chained):
+    """Build '<wt><pos><mut>' labels (1-indexed per chain), joined with ':'."""
+    wt_chains  = wt_seq_chained.split(':')
+    mut_chains = mut_seq_chained.split(':')
+    if len(wt_chains) != len(mut_chains):
+        return ''
+    muts = []
+    for w_chain, m_chain in zip(wt_chains, mut_chains):
+        if len(w_chain) != len(m_chain):
+            continue
+        for i, (w, m) in enumerate(zip(w_chain, m_chain)):
+            if w != m:
+                muts.append(f"{w}{i+1}{m}")
+    if len(muts) == 0:
+        return 'WT'
+    return ':'.join(muts)
+
+def save_heatmap_csv(data,
+                     save_path,
+                     only_mutated_positions=False,
+                     chain_ranges=None,
+                     chain_order=None):
+    """
+    Writes a CSV that is a rotated version of plot_data's heatmap.
+
+    - Rows: positions in the protein, labeled '<wt_aa><pos>' (1-indexed per chain),
+            in the same order as the heatmap's x-axis.
+    - Columns: the 20 standard amino acids.
+    - WT cells = 0.0; cells with no available mutation = blank (NaN).
+    """
+    amino_acids = ['A', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'K', 'L',
+                   'M', 'N', 'P', 'Q', 'R', 'S', 'T', 'V', 'W', 'Y']
+    aa_to_idx = {aa: i for i, aa in enumerate(amino_acids)}
+
+    # --- 1. Parse Data (mirrors plot_data) ---
+    parsed_data = {}
+    chain_sequences = {}
+
+    for _, row in data.iterrows():
+        wt_seq  = row['wildtype']
+        mut_seq = row['mutant']
+        energy  = row['ddG_pred']
+
+        wt_chains  = wt_seq.split(':')
+        mut_chains = mut_seq.split(':')
+        if len(wt_chains) != len(mut_chains):
+            continue
+
+        if chain_order:
+            current_chain_names = chain_order[:len(wt_chains)]
+        else:
+            current_chain_names = [chr(65 + i) for i in range(len(wt_chains))]
+
+        global_mutations = []
+        for c_name, w_chain, m_chain in zip(current_chain_names, wt_chains, mut_chains):
+            if len(w_chain) != len(m_chain):
+                continue
+            if c_name not in chain_sequences:
+                chain_sequences[c_name] = list(w_chain)
+            for i, (w, m) in enumerate(zip(w_chain, m_chain)):
+                if w != m:
+                    global_mutations.append((c_name, i + 1, w, m))
+
+        if len(global_mutations) == 1:
+            c_name, pos, wt, mut = global_mutations[0]
+            parsed_data.setdefault(c_name, {}).setdefault(pos, {'wt': wt, 'muts': {}})
+            parsed_data[c_name][pos]['muts'][mut] = energy
+
+    # --- 2. Determine Chains to Plot ---
+    if chain_order:
+        active_chain_names = [c for c in chain_order if c in chain_sequences]
+    else:
+        active_chain_names = sorted(chain_sequences.keys())
+
+    if not active_chain_names:
+        print("No valid data found to write.")
+        return None
+
+    # --- 3. Build rows in the SAME order plot_data uses for its x-axis ---
+    rows_out = []
+    index_labels = []
+
+    for c_name in active_chain_names:
+        full_seq = chain_sequences[c_name]
+
+        start_r, stop_r = 1, len(full_seq)
+        if chain_ranges and c_name in chain_ranges:
+            start_r, stop_r = chain_ranges[c_name]
+            if start_r == 0:  start_r = 1
+            if stop_r == -1: stop_r = len(full_seq)
+        elif chain_ranges:
+            continue
+
+        if only_mutated_positions:
+            existing_pos = sorted(parsed_data.get(c_name, {}).keys())
+            positions = [p for p in existing_pos if start_r <= p <= stop_r]
+        else:
+            actual_start = max(1, start_r)
+            actual_stop  = min(len(full_seq), stop_r)
+            positions = range(actual_start, actual_stop + 1) if actual_start <= actual_stop else []
+
+        for pos in positions:
+            wt_aa = full_seq[pos - 1]
+            row_vals = [np.nan] * len(amino_acids)
+
+            # WT cell -> 0.0
+            if wt_aa in aa_to_idx:
+                row_vals[aa_to_idx[wt_aa]] = 0.0
+
+            # Fill measured mutations
+            if c_name in parsed_data and pos in parsed_data[c_name]:
+                for mut_aa, ener in parsed_data[c_name][pos]['muts'].items():
+                    if mut_aa in aa_to_idx:
+                        row_vals[aa_to_idx[mut_aa]] = ener
+
+            rows_out.append(row_vals)
+            index_labels.append(f"{wt_aa}{pos}")
+
+    # --- 4. Write CSV ---
+    df_out = pd.DataFrame(rows_out, columns=amino_acids, index=index_labels)
+    df_out.index.name = 'position'
+    # NaNs become blank cells in CSV by default
+    df_out.to_csv(save_path, na_rep='')
 
 def plot_data(data,
               only_mutated_positions=False,
@@ -1053,3 +1176,4 @@ def plot_data(data,
     if save_path is not None:
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
     plt.show()
+
